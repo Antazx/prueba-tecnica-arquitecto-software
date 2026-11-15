@@ -120,3 +120,22 @@ razonadas y documentadas.
   valores ficticios y seguros.
 - Revisa los archivos que se van a publicar teniendo presente que el repositorio
   es público. Mantén el enunciado original como documentación del ejercicio.
+
+## Skills de agentes
+
+### GitHub y tareas
+
+Antes de operar en GitHub, lee
+[docs/agents/issue-tracker.md](docs/agents/issue-tracker.md).
+Define la cuenta `Antazx`, el repositorio de incidencias y las convenciones de trabajo.
+
+### Etiquetas de clasificación
+
+Para interpretar o cambiar la clasificación de una incidencia, usa
+[docs/agents/triage-labels.md](docs/agents/triage-labels.md).
+
+### Documentación del dominio
+
+Antes de explorar el código, consulta
+[docs/agents/domain.md](docs/agents/domain.md):
+glosario único en la raíz y decisiones de arquitectura en `docs/adr/`.
