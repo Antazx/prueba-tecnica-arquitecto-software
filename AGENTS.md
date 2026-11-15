@@ -74,8 +74,8 @@ razonadas y documentadas.
   no pueda expresar; evita comentarios que repitan lo que hace una instrucción.
 - Añade dependencias solo cuando resuelvan una necesidad concreta y justifica las
   decisiones técnicas relevantes y las alternativas descartadas.
-- No presupongas un lenguaje o framework: el enunciado deja la elección abierta.
-  No conviertas posibilidades de evolución en requisitos de la entrega inicial.
+- Usa el stack y el alcance de preparación acordados en `README.md`.
+  Conserva la separación entre el setup técnico y las funcionalidades del enunciado.
 
 ## Corrección y verificación
 
