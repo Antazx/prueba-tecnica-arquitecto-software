@@ -1,0 +1,85 @@
+name: recoletas-diagnostic-appointments
+
+x-application: &application
+  image: recoletas-diagnostic-appointments:local
+  build: .
+  init: true
+  stop_grace_period: 15s
+
+services:
+  postgres:
+    image: postgres:18.7-bookworm@sha256:ece55f7868da684e400f82f1030a050718adbdd65c23aa500c486f6e2950dc0f
+    environment:
+      POSTGRES_DB: diagnostic_appointments
+      POSTGRES_USER: diagnostic
+      POSTGRES_PASSWORD: diagnostic_dev
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      - ./db/seed.sql:/docker-entrypoint-initdb.d/20-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  rabbitmq:
+    image: rabbitmq:4.4.0@sha256:1166559c9e77b0208b9d96bfaf265ddbdd491ce3cebb8cf990aabe9274f16d2c
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: diagnostic
+      RABBITMQ_DEFAULT_PASS: diagnostic_dev
+    ports:
+      - "127.0.0.1:${RABBITMQ_PORT:-5672}:5672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  api:
+    <<: *application
+    command: ["node", "dist/bootstrap/api.js"]
+    environment:
+      DATABASE_URL: postgresql://diagnostic:diagnostic_dev@postgres:5432/diagnostic_appointments
+      HOST: 0.0.0.0
+      API_PORT: 3000
+    ports:
+      - "127.0.0.1:${API_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/ready').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+
+  worker:
+    <<: *application
+    command: ["node", "dist/bootstrap/worker.js"]
+    environment:
+      DATABASE_URL: postgresql://diagnostic:diagnostic_dev@postgres:5432/diagnostic_appointments
+      RABBITMQ_URL: amqp://diagnostic:diagnostic_dev@rabbitmq:5672?heartbeat=10
+      HOST: 0.0.0.0
+      WORKER_HEALTH_PORT: 3001
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health/ready').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
