@@ -17,7 +17,7 @@ const messages = messageUseCases(postgresScheduling(pool), write);
 const consumer = process.env.CONSUMER === "notification" ? "notification" : "allocation";
 await consumeWork(connection, consumer, async (delivery) => {
   process.send?.({ phase: "received", delivery });
-  if (process.env.PAUSE_BEFORE_HANDLE === "true") await new Promise<void>((resolve) => process.once("message", () => resolve()));
+  if (process.env.PAUSE_BEFORE_EVENT_ID === delivery.eventId) await new Promise<void>((resolve) => process.once("message", () => resolve()));
   await (consumer === "notification" ? messages.notify(delivery) : messages.allocate(delivery));
   process.send?.({ phase: "committed", delivery });
   if (process.env.PAUSE_AFTER_COMMIT === "true") await new Promise<void>((resolve) => process.once("message", () => resolve()));
