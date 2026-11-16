@@ -38,6 +38,7 @@ export function waitingListOperations(client: PoolClient): Pick<SchedulingTransa
       const slots = await client.query<{ id: string; starts_at: Date; ends_at: Date }>(`SELECT id, starts_at, ends_at
         FROM scheduling.slots WHERE hospital_id=$1 AND test_type_id=$2 ORDER BY id FOR UPDATE`, key);
       const reservations = await client.query<{ id: string; patient_id: string; slot_id: string; state: "HELD" | "OFFERED" | "CONFIRMED";
+        waiting_list_entry_id: string | null;
         created_at: Date; expires_at: Date; starts_at: Date; ends_at: Date }>(`SELECT r.*, s.starts_at, s.ends_at
         FROM scheduling.reservations r JOIN scheduling.slots s ON s.id=r.slot_id
         WHERE s.hospital_id=$1 AND s.test_type_id=$2 AND r.state IN ('HELD', 'OFFERED', 'CONFIRMED')
@@ -47,6 +48,7 @@ export function waitingListOperations(client: PoolClient): Pick<SchedulingTransa
       return { slots: slots.rows.map((row) => ({ id: row.id, startsAt: row.starts_at.getTime(), endsAt: row.ends_at.getTime() })),
         entries: entries.rows.map(entryFromRow), reservations: reservations.rows.map((row) => ({
           id: row.id, patientId: row.patient_id, slotId: row.slot_id, state: row.state,
+          waitingListEntryId: row.waiting_list_entry_id ?? undefined,
           createdAt: row.created_at.getTime(), expiresAt: row.expires_at.getTime(), startsAt: row.starts_at.getTime(), endsAt: row.ends_at.getTime(),
         })) };
     },
@@ -75,9 +77,16 @@ function validUuid(value: string): boolean {
 export async function readOwnWaitingListEntry(pool: Pool, patientId: string, entryId: string) {
   try {
     if (!validUuid(entryId)) return null;
-    const result = await pool.query<EntryRow & { evaluated_at: Date }>(`SELECT e.*, ARRAY(SELECT x.slot_id FROM scheduling.waiting_list_slot_exclusions x WHERE x.entry_id=e.id ORDER BY x.slot_id) AS excluded_slot_ids, date_trunc('milliseconds', statement_timestamp()) AS evaluated_at
-      FROM scheduling.waiting_list_entries e WHERE id=$1 AND patient_id=$2`, [entryId, patientId]);
-    return result.rows[0] ? { entry: entryFromRow(result.rows[0]), evaluatedAt: result.rows[0].evaluated_at.getTime() } : null;
+    const result = await pool.query<EntryRow & { evaluated_at: Date; offer: { id: string; slot_id: string; state: "OFFERED"; created_at: string; expires_at: string; starts_at: string; ends_at: string } | null }>(`SELECT e.*, ARRAY(SELECT x.slot_id FROM scheduling.waiting_list_slot_exclusions x WHERE x.entry_id=e.id ORDER BY x.slot_id) AS excluded_slot_ids, date_trunc('milliseconds', statement_timestamp()) AS evaluated_at,
+      (SELECT jsonb_build_object('id',r.id,'slot_id',r.slot_id,'state',r.state,'created_at',r.created_at,'expires_at',r.expires_at,'starts_at',s.starts_at,'ends_at',s.ends_at)
+        FROM scheduling.reservations r JOIN scheduling.slots s ON s.id=r.slot_id WHERE r.waiting_list_entry_id=e.id AND r.state='OFFERED') AS offer
+      FROM scheduling.waiting_list_entries e WHERE e.id=$1 AND e.patient_id=$2`, [entryId, patientId]);
+    const row = result.rows[0];
+    if (!row) return null;
+    const entry = entryFromRow(row);
+    if (row.offer) entry.offer = { id: row.offer.id, slotId: row.offer.slot_id, patientId, waitingListEntryId: entry.id, state: row.offer.state,
+      createdAt: Date.parse(row.offer.created_at), expiresAt: Date.parse(row.offer.expires_at), startsAt: Date.parse(row.offer.starts_at), endsAt: Date.parse(row.offer.ends_at) };
+    return { entry, evaluatedAt: row.evaluated_at.getTime() };
   } catch (error) { throw storageError(error); }
 }
 

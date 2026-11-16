@@ -3,9 +3,11 @@ import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import type { CreationIdentity, CreationResult, Reservation, Scheduling, SchedulingTransaction } from "../../application/scheduling.ts";
 import { storageError } from "./errors.ts";
+import { messageOperations } from "./messages.ts";
 
 interface ReservationRow {
   id: string; slot_id: string; patient_id: string; state: Reservation["state"];
+  waiting_list_entry_id: string | null;
   closure_reason: Reservation["closureReason"] | null;
   created_at: Date; expires_at: Date; starts_at: Date; ends_at: Date; evaluated_at: Date;
 }
@@ -18,6 +20,7 @@ async function patientExists(client: Pool | PoolClient, patientId: string): Prom
 function transactionOperations(client: PoolClient): SchedulingTransaction {
   return {
     ...waitingListOperations(client),
+    ...messageOperations(client),
     patientExists: (patientId) => patientExists(client, patientId),
     async coordinateCreation(identity: CreationIdentity) {
       const key = [identity.patientId, identity.operation, identity.key];
@@ -61,6 +64,7 @@ function transactionOperations(client: PoolClient): SchedulingTransaction {
         WHERE r.id = $1 AND r.patient_id = $2 FOR UPDATE OF r`, [reservationId, patientId]);
       const row = result.rows[0];
       return row ? { id: row.id, slotId: row.slot_id, patientId: row.patient_id, state: row.state, closureReason: row.closure_reason ?? undefined,
+        waitingListEntryId: row.waiting_list_entry_id ?? undefined,
         createdAt: row.created_at.getTime(), expiresAt: row.expires_at.getTime(),
         startsAt: row.starts_at.getTime(), endsAt: row.ends_at.getTime() } : null;
     },

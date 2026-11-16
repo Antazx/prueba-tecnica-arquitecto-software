@@ -71,7 +71,7 @@ it("rejects an incompatible destination but keeps equal keys of different patien
 it("shows pending expiry without writing and conservatively keeps a persisted expired hold occupied", async () => {
   await slot("hold-test-expired");
   const id = randomUUID();
-  await pool.query(`INSERT INTO scheduling.reservations VALUES ($1, 'hold-test-expired', 'patient-ana', 'HELD',
+  await pool.query(`INSERT INTO scheduling.reservations(id, slot_id, patient_id, state, created_at, expires_at) VALUES ($1, 'hold-test-expired', 'patient-ana', 'HELD',
     date_trunc('milliseconds', clock_timestamp()) - interval '20 minutes',
     date_trunc('milliseconds', clock_timestamp()) - interval '10 minutes')`, [id]);
   const readOnlyUrl = new URL(databaseUrl);
@@ -88,7 +88,7 @@ it("shows pending expiry without writing and conservatively keeps a persisted ex
     expect(attempt.statusCode).toBe(409);
     expect(attempt.json().code).toBe("SLOT_OCCUPIED");
     // This probes the persisted uniqueness boundary directly, outside the normal writer protocol.
-    await expect(pool.query(`INSERT INTO scheduling.reservations VALUES ($1, 'hold-test-expired', 'patient-bruno', 'HELD',
+    await expect(pool.query(`INSERT INTO scheduling.reservations(id, slot_id, patient_id, state, created_at, expires_at) VALUES ($1, 'hold-test-expired', 'patient-bruno', 'HELD',
       date_trunc('milliseconds', clock_timestamp()), date_trunc('milliseconds', clock_timestamp()) + interval '10 minutes')`, [randomUUID()]))
       .rejects.toMatchObject({ code: "23505", constraint: "reservations_one_occupant_idx" });
   } finally { await readOnlyApi.close(); await reader.end(); }
@@ -155,7 +155,7 @@ it("caps the persisted deadline at an approaching start and rejects a started sl
 it("exposes a confirmed reservation without marking its previous deadline expired", async () => {
   await slot("hold-test-confirmed");
   const id = randomUUID();
-  await pool.query(`INSERT INTO scheduling.reservations VALUES ($1, 'hold-test-confirmed', 'patient-ana', 'CONFIRMED',
+  await pool.query(`INSERT INTO scheduling.reservations(id, slot_id, patient_id, state, created_at, expires_at) VALUES ($1, 'hold-test-confirmed', 'patient-ana', 'CONFIRMED',
     date_trunc('milliseconds', clock_timestamp()) - interval '20 minutes',
     date_trunc('milliseconds', clock_timestamp()) - interval '10 minutes')`, [id]);
   const response = await api.inject({ url: `/reservations/${id}`, headers: { "x-patient-id": "patient-ana" } });

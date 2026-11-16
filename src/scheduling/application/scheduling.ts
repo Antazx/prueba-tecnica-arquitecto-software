@@ -1,10 +1,12 @@
 import type { WaitingListEntry, WaitingListRepresentation, WaitingListScope, AdmissionState } from "./waiting-list.ts";
 import type { ReservationClosureReason, ReservationState } from "../domain/reservation.ts";
+import type { Delivery, LogicalEvent, OfferNotification } from "./messages.ts";
 
 export interface Reservation {
   id: string;
   slotId: string;
   patientId: string;
+  waitingListEntryId?: string;
   state: ReservationState;
   closureReason?: ReservationClosureReason;
   createdAt: number;
@@ -29,6 +31,10 @@ export interface ProtectedSlot { id: string; startsAt: number; endsAt: number; o
 
 // All methods in this callback share one transaction. No driver object crosses this boundary.
 export interface SchedulingTransaction {
+  coordinateConsumption(delivery: Delivery): Promise<LogicalEvent | null>;
+  completeConsumption(delivery: Delivery, outcome: "succeeded" | "discarded", time: number): Promise<void>;
+  readOfferNotification(reservationId: string, eventId: string): Promise<OfferNotification | null>;
+  insertOffer(reservation: Reservation & { waitingListEntryId: string }, scope: WaitingListScope): Promise<void>;
   lockWaitingListScope(scope: WaitingListScope): Promise<boolean>;
   lockOwnWaitingListEntry(patientId: string, entryId: string): Promise<WaitingListEntry | null>;
   closeWaitingListEntry(entryId: string, reason: NonNullable<WaitingListEntry["closureReason"]>): Promise<void>;

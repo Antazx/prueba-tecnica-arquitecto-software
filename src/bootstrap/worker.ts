@@ -1,5 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
-import type { ChannelModel } from "amqplib";
+import type { ChannelModel, ConfirmChannel } from "amqplib";
 import { readWorkerConfig } from "../config/environment.ts";
 import { createWorkerHealthServer, type WorkerHealth } from "../scheduling/adapters/http/worker-health.ts";
 import { checkDatabase, createDatabasePool } from "../scheduling/adapters/postgres/database.ts";
@@ -7,6 +7,10 @@ import { initializeDatabase } from "../scheduling/adapters/postgres/initialize.t
 import { postgresScheduling } from "../scheduling/adapters/postgres/scheduling.ts";
 import { schedulingUseCases } from "../scheduling/application/reservations.ts";
 import { connectToRabbitMq } from "../scheduling/adapters/rabbitmq/connection.ts";
+import { assertTopology, consumeWork, publishConfirmed } from "../scheduling/adapters/rabbitmq/messaging.ts";
+import { messageUseCases } from "../scheduling/application/messages.ts";
+import { postgresOutbox } from "../scheduling/adapters/postgres/outbox.ts";
+import { structuredNotificationWriter } from "../scheduling/adapters/notification.ts";
 
 async function main() {
   const config = readWorkerConfig();
@@ -15,8 +19,13 @@ async function main() {
   const healthServer = createWorkerHealthServer(state);
   const controller = new AbortController();
   let connection: ChannelModel | undefined;
+  let publisher: ConfirmChannel | undefined;
   let initialized = false;
-  const scheduling = schedulingUseCases(postgresScheduling(pool));
+  let nextSweep = 0;
+  const store = postgresScheduling(pool);
+  const scheduling = schedulingUseCases(store);
+  const messages = messageUseCases(store, structuredNotificationWriter(), { offerMaximumMs: config.offerMaximumMs });
+  const outbox = postgresOutbox(pool);
 
   pool.on("error", () => { state.postgres = false; });
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
@@ -38,7 +47,10 @@ async function main() {
           initialized = true;
         }
         await checkDatabase(pool);
-        await scheduling.expireDirectHolds();
+        if (Date.now() >= nextSweep) {
+          await scheduling.expireDirectHolds();
+          nextSweep = Date.now() + config.expirySweepIntervalMs;
+        }
         state.postgres = true;
       } catch (error) {
         initialized = false;
@@ -50,16 +62,46 @@ async function main() {
         try {
           const opened = await connectToRabbitMq(config.rabbitmqUrl);
           connection = opened;
-          state.rabbitmq = true;
           opened.on("error", () => { state.rabbitmq = false; });
           opened.once("close", () => {
-            if (connection === opened) connection = undefined;
+            if (connection === opened) { connection = undefined; publisher = undefined; }
             state.rabbitmq = false;
             if (!controller.signal.aborted) {
               console.warn(JSON.stringify({ event: "rabbitmq_disconnected", service: "diagnostic-appointments-worker" }));
             }
           });
+          const topology = await opened.createChannel();
+          await assertTopology(topology);
+          await topology.close();
+          if (config.relayEnabled) {
+            publisher = await opened.createConfirmChannel();
+            publisher.on("error", () => { state.rabbitmq = false; });
+            publisher.once("close", () => { void opened.close().catch(() => {}); });
+          }
+          for (const consumer of ["allocation", "notification"] as const) {
+            const channel = await consumeWork(opened, consumer, consumer === "allocation" ? messages.allocate : messages.notify);
+            channel.once("close", () => { void opened.close().catch(() => {}); });
+          }
+          state.rabbitmq = true;
         } catch {
+          state.rabbitmq = false;
+          await connection?.close().catch(() => {});
+          connection = undefined;
+          publisher = undefined;
+        }
+      }
+
+      if (publisher && state.postgres && state.rabbitmq) {
+        try {
+          for (const delivery of await outbox.ready()) {
+            await publishConfirmed(publisher, "appointments.work", delivery.consumer, delivery);
+            await outbox.published(delivery.publicationId);
+          }
+        } catch (error) {
+          console.warn(JSON.stringify({ event: "outbox_publication_failed", message: error instanceof Error ? error.message : "Unknown error" }));
+          await connection?.close().catch(() => {});
+          connection = undefined;
+          publisher = undefined;
           state.rabbitmq = false;
         }
       }
@@ -68,7 +110,7 @@ async function main() {
       if (ready !== wasReady) {
         console.info(JSON.stringify({ event: ready ? "worker_ready" : "worker_not_ready", dependencies: state }));
       }
-      await delay(config.expirySweepIntervalMs, undefined, { signal: controller.signal }).catch((error: unknown) => {
+      await delay(Math.min(config.expirySweepIntervalMs, 250), undefined, { signal: controller.signal }).catch((error: unknown) => {
         if (!controller.signal.aborted) throw error;
       });
     }

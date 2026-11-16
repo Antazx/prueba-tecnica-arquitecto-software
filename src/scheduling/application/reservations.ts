@@ -1,17 +1,8 @@
 import { waitingListUseCases } from "./waiting-list.ts";
 import { randomUUID } from "node:crypto";
 import { decideDirectHold, evaluateReservation, decideConfirmation, decideCancellation } from "../domain/reservation.ts";
-import type { Reservation, ReservationRepresentation, Scheduling } from "./scheduling.ts";
-
-function represent(reservation: Reservation): ReservationRepresentation {
-  return {
-    id: reservation.id, slotId: reservation.slotId, state: reservation.state,
-    createdAt: new Date(reservation.createdAt).toISOString(),
-    expiresAt: new Date(reservation.expiresAt).toISOString(),
-    startsAt: new Date(reservation.startsAt).toISOString(),
-    endsAt: new Date(reservation.endsAt).toISOString(),
-  };
-}
+import type { Reservation, Scheduling } from "./scheduling.ts";
+import { representReservation as represent } from "./reservation-representation.ts";
 
 export function schedulingUseCases(scheduling: Scheduling, options: { holdTtlMs?: number } = {}) {
   return {
@@ -51,6 +42,8 @@ export function schedulingUseCases(scheduling: Scheduling, options: { holdTtlMs?
         if (decision.state !== reservation.state) {
           await transaction.setReservationState(reservation.id, decision.state);
           if (decision.state === "EXPIRED") await transaction.recordSlotRelease(reservation, "EXPIRED", evaluatedAt);
+          if (reservation.waitingListEntryId) await transaction.closeWaitingListEntry(reservation.waitingListEntryId,
+            decision.state === "CONFIRMED" ? "ACCEPTED" : "EXPIRED");
         }
         const body = represent({ ...reservation, state: decision.state });
         return { status: decision.allowed ? 200 : 409, body: decision.allowed ? body : { ...body, code: decision.code } };
