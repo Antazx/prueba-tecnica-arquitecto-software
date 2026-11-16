@@ -1,3 +1,4 @@
+import { waitingListOperations, readOwnWaitingListEntry, waitingListPrioritySql } from "./waiting-list.ts";
 import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import type { CreationIdentity, CreationResult, Reservation, Scheduling, SchedulingTransaction } from "../../application/scheduling.ts";
@@ -16,6 +17,7 @@ async function patientExists(client: Pool | PoolClient, patientId: string): Prom
 
 function transactionOperations(client: PoolClient): SchedulingTransaction {
   return {
+    ...waitingListOperations(client),
     patientExists: (patientId) => patientExists(client, patientId),
     async coordinateCreation(identity: CreationIdentity) {
       const key = [identity.patientId, identity.operation, identity.key];
@@ -36,12 +38,12 @@ function transactionOperations(client: PoolClient): SchedulingTransaction {
       await client.query(`SELECT hospital_id FROM scheduling.waiting_list_scopes
         WHERE hospital_id = $1 AND test_type_id = $2 FOR UPDATE`, [scope.rows[0].hospital_id, scope.rows[0].test_type_id]);
       // READ COMMITTED, new commands after the wait: do not reuse pre-lock snapshots.
-      const slots = await client.query<{ id: string; starts_at: Date; ends_at: Date }>(
-        "SELECT id, starts_at, ends_at FROM scheduling.slots WHERE id = $1 FOR UPDATE", [slotId]);
+      const slots = await client.query<{ id: string; starts_at: Date; ends_at: Date; waiting_priority: boolean }>(
+        `SELECT s.id, s.starts_at, s.ends_at, ${waitingListPrioritySql} AS waiting_priority FROM scheduling.slots s WHERE s.id = $1 FOR UPDATE OF s`, [slotId]);
       const occupants = await client.query(`SELECT id FROM scheduling.reservations
         WHERE slot_id = $1 AND state IN ('HELD', 'OFFERED', 'CONFIRMED') ORDER BY id FOR UPDATE`, [slotId]);
       const slot = slots.rows[0];
-      return { id: slot.id, startsAt: slot.starts_at.getTime(), endsAt: slot.ends_at.getTime(), occupied: occupants.rowCount !== 0 };
+      return { id: slot.id, startsAt: slot.starts_at.getTime(), endsAt: slot.ends_at.getTime(), occupied: occupants.rowCount !== 0, waitingPriority: slot.waiting_priority };
     },
     async lockOwnReservation(patientId, reservationId) {
       if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(reservationId)) return null;
@@ -122,6 +124,7 @@ export function postgresScheduling(pool: Pool): Scheduling {
     async patientExists(patientId) {
       try { return await patientExists(pool, patientId); } catch (error) { throw storageError(error); }
     },
+    readOwnWaitingListEntry: (patientId, entryId) => readOwnWaitingListEntry(pool, patientId, entryId),
     async dueDirectHolds() {
       try {
         // Candidates only: every transition locks and revalidates the reservation afresh.

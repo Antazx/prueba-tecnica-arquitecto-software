@@ -1,3 +1,4 @@
+import { waitingListUseCases } from "./waiting-list.ts";
 import { randomUUID } from "node:crypto";
 import { decideDirectHold, evaluateReservation, decideConfirmation, decideCancellation } from "../domain/reservation.ts";
 import type { Reservation, ReservationRepresentation, Scheduling } from "./scheduling.ts";
@@ -14,6 +15,7 @@ function represent(reservation: Reservation): ReservationRepresentation {
 
 export function schedulingUseCases(scheduling: Scheduling, options: { holdTtlMs?: number } = {}) {
   return {
+    ...waitingListUseCases(scheduling),
     async createHold(patientId: string, slotId: string, key: string) {
       const identity = { patientId, operation: "create-hold", key };
       // There is no request body: the normalized destination is the entire intention.
