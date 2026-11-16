@@ -1,7 +1,6 @@
 import type { FastifySchema } from "fastify";
 import { invalidRequestSchema, dependencyUnavailableSchema, internalErrorSchema } from "./error-schemas.ts";
-
-const utcInstant = { type: "string", format: "date-time", pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" };
+import { utcInstantSchema } from "./scheduling-schemas.ts";
 
 export const agendaSchema: FastifySchema = {
   operationId: "listSlots",
@@ -35,7 +34,7 @@ export const agendaSchema: FastifySchema = {
       description: "Agenda del ámbito en el instante indicado, sin datos de pacientes.",
       type: "object", required: ["evaluatedAt", "slots"], additionalProperties: false,
       properties: {
-        evaluatedAt: utcInstant,
+        evaluatedAt: utcInstantSchema,
         slots: {
           type: "array",
           items: {
@@ -43,7 +42,7 @@ export const agendaSchema: FastifySchema = {
             required: ["id", "resourceId", "hospitalId", "testTypeId", "startsAt", "endsAt", "directlyBookable"],
             properties: {
               id: { type: "string" }, resourceId: { type: "string" }, hospitalId: { type: "string" }, testTypeId: { type: "string" },
-              startsAt: utcInstant, endsAt: utcInstant,
+              startsAt: utcInstantSchema, endsAt: utcInstantSchema,
               directlyBookable: { type: "boolean", description: "Admite un bloqueo directo según ocupación y prioridad en evaluatedAt. No garantiza la decisión de una petición posterior." },
             },
           },
