@@ -5,13 +5,14 @@ import type { Outbox } from "../../application/outbox.ts";
 export function postgresOutbox(pool: Pool): Outbox {
   return {
     async ready(): Promise<Delivery[]> {
-      const result = await pool.query<{ id: string; event_id: string; consumer: Delivery["consumer"]; cycle: number; attempt: number }>(`SELECT p.id,p.event_id,p.consumer,p.cycle,p.attempt
+      const result = await pool.query<{ id: string; event_id: string; consumer: Delivery["consumer"]; cycle: number; attempt: number; destination: string }>(`SELECT p.id,p.event_id,p.consumer,p.cycle,p.attempt,p.destination
         FROM scheduling.outbox_publications p
         LEFT JOIN scheduling.consumer_attempts a USING (event_id,consumer,cycle,attempt)
         WHERE p.published_at IS NULL AND GREATEST(p.available_at,p.next_attempt_at) <= clock_timestamp()
           AND (a.not_before IS NULL OR a.not_before <= clock_timestamp())
         ORDER BY GREATEST(p.available_at,p.next_attempt_at,a.not_before),p.created_at,p.id LIMIT 20`);
-      return result.rows.map((row) => ({ version: 1, publicationId: row.id, eventId: row.event_id, consumer: row.consumer, cycle: row.cycle, attempt: row.attempt }));
+      return result.rows.map((row) => ({ version: 1, publicationId: row.id, eventId: row.event_id, consumer: row.consumer, cycle: row.cycle, attempt: row.attempt,
+        ...(row.destination === "dead" ? { destination: "dead" as const } : {}) }));
     },
     async started(publicationId, retryDelayMs) {
       // Persist a conservative next date before network I/O, including an uncertain crash.

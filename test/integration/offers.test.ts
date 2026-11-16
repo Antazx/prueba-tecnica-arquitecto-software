@@ -163,19 +163,26 @@ it("awaits output completion outside the business scope and allows a log checked
   expect((await pool.query("SELECT outcome FROM scheduling.consumer_results WHERE event_id=$1", [notification.eventId])).rows).toEqual([{ outcome: "succeeded" }]);
 });
 
-it("rolls back failed notification output and revalidates a now invalid offer on redelivery", async () => {
+it("retains failed notification output and revalidates a now invalid offer on its scheduled retry", async () => {
   const { offer, notification } = await offerToAna();
   const output = new Writable({ write(_chunk, _encoding, callback) { callback(new Error("Synthetic output failure")); } });
   // Node may emit error after invoking its write callback; keep the stream's failed state observed.
   output.on("error", () => {});
-  await expect(messageUseCases(scheduling, structuredNotificationWriter(output)).notify(notification)).rejects.toThrow("Synthetic output failure");
-  expect((await pool.query("SELECT outcome FROM scheduling.consumer_results WHERE event_id=$1", [notification.eventId])).rows).toEqual([]);
+  await messageUseCases(scheduling, structuredNotificationWriter(output)).notify(notification);
+  expect((await pool.query("SELECT outcome FROM scheduling.consumer_results WHERE event_id=$1", [notification.eventId])).rows).toEqual([{ outcome: null }]);
+  expect((await pool.query("SELECT outcome,last_error FROM scheduling.consumer_attempts WHERE event_id=$1 AND attempt=0", [notification.eventId])).rows)
+    .toEqual([{ outcome: "failed", last_error: "Synthetic output failure" }]);
   await api.confirmReservation("patient-ana", offer.id);
   let written = false;
   await messageUseCases(scheduling, async () => { written = true; }).notify(notification);
   expect(written).toBe(false);
+  expect((await pool.query("SELECT outcome FROM scheduling.consumer_results WHERE event_id=$1", [notification.eventId])).rows).toEqual([{ outcome: null }]);
+  const next = (await pool.query("SELECT * FROM scheduling.outbox_publications WHERE event_id=$1 AND attempt=1", [notification.eventId])).rows[0];
+  await eventually(async () => (await postgresOutbox(pool).ready()).some((row) => row.publicationId === next.id), Boolean, 7000);
+  await messageUseCases(scheduling, async () => { written = true; }).notify({ ...notification, attempt: 1, publicationId: next.id });
+  expect(written).toBe(false);
   expect((await pool.query("SELECT outcome FROM scheduling.consumer_results WHERE event_id=$1", [notification.eventId])).rows).toEqual([{ outcome: "discarded" }]);
-});
+}, 10000);
 
 it("uses chronological slot IDs and FIFO regardless of message order, accepting the documented matching cost", async () => {
   await pool.query("INSERT INTO scheduling.diagnostic_resources VALUES ('offer-test-second-resource',$1,$2)", [scope.hospitalId, scope.testTypeId]);
@@ -301,16 +308,18 @@ it("can repeat a real output written before a rolled-back consumer completion", 
   const lines: string[] = [];
   const output = new Writable({ write(chunk, _encoding, callback) { lines.push(chunk.toString()); callback(); } });
   const writer = structuredNotificationWriter(output);
-  await expect(messageUseCases(scheduling, async (notice) => {
+  await messageUseCases(scheduling, async (notice) => {
     await writer(notice);
     throw new Error("Synthetic failure after output before result");
-  }).notify(notification)).rejects.toThrow("Synthetic failure after output before result");
-  expect((await pool.query("SELECT outcome FROM scheduling.consumer_results WHERE event_id=$1", [notification.eventId])).rows).toEqual([]);
-  await messageUseCases(scheduling, writer).notify(notification);
+  }).notify(notification);
+  expect((await pool.query("SELECT outcome FROM scheduling.consumer_results WHERE event_id=$1", [notification.eventId])).rows).toEqual([{ outcome: null }]);
+  const next = (await pool.query("SELECT * FROM scheduling.outbox_publications WHERE event_id=$1 AND attempt=1", [notification.eventId])).rows[0];
+  await eventually(async () => (await postgresOutbox(pool).ready()).some((row) => row.publicationId === next.id), Boolean, 7000);
+  await messageUseCases(scheduling, writer).notify({ ...notification, attempt: 1, publicationId: next.id });
   expect(lines).toHaveLength(2);
   expect(lines[0]).toBe(lines[1]);
   expect((await pool.query("SELECT outcome FROM scheduling.consumer_results WHERE event_id=$1", [notification.eventId])).rows).toEqual([{ outcome: "succeeded" }]);
-});
+}, 10000);
 
 it("omits an expired notice and leaves its persisted reservation untouched", async () => {
   const { offer, notification } = await offerToAna(100);

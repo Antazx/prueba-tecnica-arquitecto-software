@@ -90,7 +90,8 @@ Q17 conserva un límite físico finito en RabbitMQ y exige traslado seguro a DLQ
 mediante `at-least-once`, `reject-publish` y DLX configurado. El presupuesto lógico
 de PostgreSQL se mantiene separado; ambos motivos de aparcado serán recuperables.
 La topología versionada y su configuración efectiva se comprueban con servicios
-reales. Los reintentos lógicos y la recuperación manual se entregarán por separado.
+reales. Los reintentos lógicos y el aparcado ya están implementados; la recuperación
+manual se entrega por separado.
 
 Q21 conserva los registros técnicos durante toda la vida de la demo, sin purgas
 automáticas. Q22 hace prevalecer la caducidad al intentar cancelar un bloqueo
@@ -115,7 +116,8 @@ Están implementados la consulta de agenda, los bloqueos, su consulta propia,
 confirmación, cancelación y barrido de bloqueos vencidos con outbox, además del
 alta/consulta/retirada de espera y su prioridad, adjudicación asíncrona,
 aviso, aceptación, rechazo, barrido de ofertas y reinscripción independiente del
-barrido. La recuperación de mensajería sigue pendiente.
+barrido. También están implementados los reintentos durables y el aparcado; queda
+pendiente la herramienta de recuperación manual.
 
 ## Arranque con un comando
 
@@ -469,7 +471,10 @@ TEST_DATABASE_URL=postgresql://diagnostic:diagnostic_dev@127.0.0.1:55434/diagnos
 HTTP con Fastify `inject`, PostgreSQL y RabbitMQ reales. La E2E arranca dos APIs
 y dos workers, usa HTTP de red y crea una base sintética por ejecución; requiere
 que el usuario de pruebas pueda crear bases. Estas bases se conservan como
-artefactos locales. La CI arranca los servicios con Compose después del checkout
+artefactos locales. El caso completo de reintentos espera los 155 segundos de
+backoff acordados, además de ejecución y transporte. El traslado del broker con
+DLQ reparada puede esperar el temporizador interno de RabbitMQ 4.4 de 180 segundos;
+la prueba deja esa configuración intacta. La CI arranca los servicios con Compose después del checkout
 para montar las definiciones versionadas del broker y comprobarlas antes de probar.
 Las consultas se comprueban también
 con una conexión de solo lectura. La concurrencia arranca dos procesos Node con
@@ -667,6 +672,33 @@ Puede repetirse tras una caída entre escribir y registrar, o aparecer tarde si
 vence después de comprobarla. No acredita recepción humana, vigencia al leerlo
 ni captura durable por la plataforma. Aceptar siempre revalida.
 
+Un fallo específico transitorio revierte primero el negocio. Después, otra
+transacción adquiere la misma coordinación evento/consumidor y revalida el resultado
+terminal, ciclo vigente e intento: otra entrega pudo ganar durante el rollback.
+Si sigue pendiente, guarda el error y el intento fallido junto con el siguiente
+intento y su publicación outbox. Las esperas son 5 s, 30 s y 120 s desde el fallo
+anterior, con cuatro intentos como máximo por ciclo. `not_before` y `available_at`
+conservan esa espera tras reiniciar; un mensaje adelantado no puede ejecutarla.
+Una copia del intento fallido, incluso con otro ID de publicación, reconoce lo
+ya guardado sin ejecutar de nuevo, adelantar fechas ni duplicar presupuesto.
+
+El cuarto fallo o un error permanente de contrato/referencia aparcan el ciclo.
+La publicación a `appointments.dead` y su ruta propia se guarda en outbox antes
+del ack original; aparcar no guarda éxito del negocio. Un destino sin ruta deja
+esa publicación pendiente con la misma recuperación del relay. Si falla la BD
+durante la recuperación, no hay ack. Ante commit incierto se consulta de nuevo
+la evidencia bajo coordinación; si tampoco puede comprobarse, la reentrega
+posterior resuelve el resultado sin repetir una planificación comprometida.
+
+Un aviso ya inválido termina con descarte sin gastar el resto del presupuesto.
+Errores de conexión/indisponibilidad global de PostgreSQL y un destino de logs
+roto (`EPIPE`, stream destruido o terminado) conservan el mensaje sin gastar
+intentos. Cada consumidor tiene `prefetch=1` y espera un segundo antes de un
+`nack` de pausa; en RabbitMQ 4.4 ese `nack` no aumenta fallos físicos. Los conflictos
+SQL transitorios de una operación y los fallos específicos de escritura sí pasan
+por la programación lógica. Errores sin recuperación SQL demostrable conservan
+la entrega; las caídas del proceso siguen protegidas por el límite físico.
+
 `rabbitmq/definitions.json` y `rabbitmq/rabbitmq.conf` aprovisionan desde vacío
 usuario/credencial ficticios, exchanges, bindings y cuatro colas quorum durables:
 `appointments.allocation`, `appointments.notifications` y sus dos `.dlq`. Las
@@ -676,7 +708,13 @@ principales tienen `delivery-limit=20`, DLX `at-least-once`, rutas específicas 
 argumentos, política efectiva, bindings, operator policies y flags reales.
 En RabbitMQ 4.4, `basic.reject(requeue=true)` incrementa fallos físicos; se observan
 contadores 0…20 y el siguiente fallo supera el límite. No equivale a veinte
-adquisiciones totales ni al futuro presupuesto lógico de cuatro intentos.
+adquisiciones totales ni al presupuesto lógico de cuatro intentos.
+Si falta la ruta DLQ, el broker retiene el traslado aunque los contadores de
+mensajes listos estén a cero. Recuperarla puede esperar hasta su siguiente
+reintento interno: RabbitMQ 4.4 usa por defecto 180 segundos en
+[`dead_letter_worker_publisher_confirm_timeout`](https://github.com/rabbitmq/rabbitmq-server/blob/v4.4.0/deps/rabbit/Makefile#L113-L114).
+Es un temporizador del traslado del broker, independiente de las esperas SQL y
+del envío del relay; ninguna de esas cifras promete un plazo máximo de entrega.
 
 Compose arranca un solo worker con `RELAY_ENABLED=true` por defecto. En ejecución
 Node el valor predeterminado es `false`; habilitarlo explícitamente en W1 y dejar
@@ -722,15 +760,19 @@ Comprueban claves históricas y nuevas, GET con conexión de solo lectura, un fa
 diferido al commit y dos APIs que cruzan el vencimiento mientras esperan
 coordinación; no atribuyen el reloj de PostgreSQL a temporizadores JavaScript.
 
+Las pruebas de reintentos usan PostgreSQL y RabbitMQ reales, dos procesos con
+barreras observadas y un proxy TCP que pierde confirmaciones de commit o retiene
+la respuesta de rollback para dejar ganar a otra entrega. El ciclo completo espera
+5 s, 30 s y 120 s reales; reinicia el consumidor tras registrar el primer fallo
+y antes del ack. También comprueba caída repetida antes de cualquier registro SQL,
+aparcado de aplicación con ruta DLQ rota y traslado del broker con destino sin
+ruta. Estos experimentos distinguen siempre intentos SQL de envíos y fallos AMQP.
+
 ## Alcance pendiente
 
-- Presupuesto lógico, backoff SQL, aparcado de fallos y recuperación manual
-  (#12–#13). Hasta entonces un fallo revierte negocio y conserva la entrega,
-  espera un segundo antes de rechazar/reencolar cada fallo y usa la protección
-  del broker;
-  todavía no acredita las garantías de reintento lógico/outage de la spec.
-- Prueba de retención DLX con destino indisponible y recuperación de ambos caminos
-  de DLQ, correspondientes a las entregas de recuperación. No hay purgas automáticas.
+- Herramienta de recuperación manual idempotente de ambos caminos de DLQ (#13),
+  incluidos aparcados físicos sin fallo SQL previo. Hasta incorporarla, reparar
+  una causa no abre automáticamente otro ciclo ni saca trabajo de las DLQ.
 - Consolidación final de documentación y cobertura compartida (#14).
 
 Los volúmenes y el nombre de nodo conservan estado en reinicios normales. Este

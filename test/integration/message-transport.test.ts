@@ -48,3 +48,24 @@ it("applies delivery-limit 20 with basic.reject and protects the DLQ against fur
   }
   process.stdout.write(`Observed physical failure counts ${JSON.stringify(counts)} and 22 protected DLQ redeliveries\n`);
 }, 20000);
+
+it("retains a broker dead letter while its DLQ has no route and delivers it after repair", async () => {
+  const body = { version: 1, publicationId: randomUUID(), eventId: randomUUID(), consumer: "allocation", cycle: 0, attempt: 0 } as const;
+  await channel.unbindQueue("appointments.allocation.dlq", "appointments.dead", "allocation.dead");
+  try {
+    await publishConfirmed(channel, "appointments.work", "allocation", body);
+    const received = await eventually(() => channel.get("appointments.allocation", { noAck: false }), Boolean, 5000);
+    if (!received) throw new Error("Expected original work");
+    channel.reject(received, false);
+    // A mandatory send independently proves the destination is still inaccessible.
+    await expect(publishConfirmed(channel, "appointments.dead", "allocation.dead", body)).rejects.toThrow("unroutable");
+    expect((await channel.checkQueue("appointments.allocation.dlq")).messageCount).toBe(0);
+  } finally { await channel.bindQueue("appointments.allocation.dlq", "appointments.dead", "allocation.dead"); }
+  // RabbitMQ 4.4 defaults its internal DLX confirm/retry timer to 180 seconds.
+  // Leave that broker setting intact; it is separate from SQL's 5/30/120s budget.
+  const dead = await eventually(() => channel.get("appointments.allocation.dlq", { noAck: false }), Boolean, 205000);
+  if (!dead) throw new Error("Expected retained broker dead letter");
+  expect(JSON.parse(dead.content.toString())).toEqual(body);
+  expect(dead.properties.headers?.["x-death"]?.[0]).toMatchObject({ reason: "rejected", queue: "appointments.allocation" });
+  channel.ack(dead);
+}, 210000);
