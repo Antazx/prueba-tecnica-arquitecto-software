@@ -4,6 +4,108 @@ Preparación técnica de la [prueba de arquitectura de software](docs/diagnostic
 Esta entrega prepara el entorno y sus conexiones. La agenda, los bloqueos, las citas
 y la lista de espera se implementarán en las siguientes entregas funcionales.
 
+## Diseño funcional acordado
+
+El [diseño funcional consolidado](docs/functional-design.md), revisión 5 de
+2026-11-16, es la referencia vigente de Q1–Q26 y los criterios AC01–AC69.
+Incorpora las últimas respuestas aceptadas y las correcciones de trazabilidad
+de Q24. La [referencia técnica](docs/technical-design.md) registra su procedencia
+y verificación de integridad. El [glosario](GLOSSARY.md) recoge su vocabulario.
+Este resumen refleja las decisiones vigentes, incluidas las revisiones del
+grilling; todavía no describe comportamientos implementados ni verificados.
+
+1. **Agenda precargada.** La demo usará huecos sintéticos precargados, sin
+   operaciones de administración de agendas. El seed se validará para impedir
+   intervalos solapados de un mismo recurso. La exclusividad concurrente que
+   implementará el servicio será por hueco; esa garantía, por sí sola, no impide
+   solapamientos entre huecos diferentes de una máquina.
+2. **Admisión condicionada, Q2 revisada y Q24.** Primero se recuperará un éxito
+   previo de la clave; para una intención nueva se resolverán vencimientos bajo
+   coordinación y se devolverá una inscripción realmente activa si existe.
+   Solo al decidir una admisión nueva se comprobará Q24: un bloqueo directo
+   propio `HELD` vigente del mismo hospital y tipo de prueba produce
+   `409 ACTIVE_HOLD_IN_SCOPE`. Si no lo hay pero existe disponibilidad directa,
+   Q2 responderá `409` con otro motivo e información de disponibilidad. Ninguno
+   de esos rechazos crea inscripción ni registra un alta exitosa; los cierres y
+   liberaciones ya decididos se comprometen pese al conflicto. Si procede
+   admitir, inscripción, resultado exitoso y activación durable del ámbito se
+   guardarán juntos. No se prohíbe globalmente coexistir bloqueo e inscripción
+   ni se modifica el endpoint de bloqueo por Q24.
+3. **Orden de adjudicación.** Los huecos candidatos se examinarán por inicio
+   ascendente y un desempate estable. Cada uno se ofrecerá a la primera
+   inscripción elegible. Se acepta que las exclusiones dejen capacidad libre;
+   no se buscará una combinación óptima global. El
+   [ADR de adjudicación](docs/adr/0001-chronological-slot-allocation.md) conserva
+   el motivo y un ejemplo de esa consecuencia.
+4. **Límite de cancelación.** Una cita confirmada solo podrá cancelarse antes
+   del inicio del hueco; en la igualdad o después se rechazará una cancelación
+   nueva. Repetir una cancelación ya completada seguirá siendo idempotente,
+   aunque la repetición llegue después del inicio. No se añaden estados de
+   asistencia o realización de la prueba.
+5. **Validez del aviso.** El consumidor comprobará inmediatamente antes de
+   emitirlo que la reserva concreta sigue ofrecida y no ha vencido. Puede haber
+   una cancelación o caducidad entre esa comprobación y la emisión del log; la
+   garantía se refiere al instante de comprobación, no al de observación del
+   aviso. Este incluirá el vencimiento persistido y comunicará una oferta sujeta
+   a vigencia. La aceptación revalidará estado y plazo de forma atómica.
+6. **Presupuesto de reintentos.** Para fallos transitorios se acepta un intento
+   inicial y tres reintentos, con esperas de cinco segundos, treinta segundos y
+   dos minutos desde el fallo anterior. Agotado el presupuesto, el trabajo se
+   conservará en una DLQ para recuperación explícita. Una caída general de
+   dependencias deberá pausar o limitar el consumo; las reentregas físicas de
+   AMQP no equivalen automáticamente a nuevos intentos de procesamiento.
+
+El plan de pruebas deberá cubrir el alta concurrente con una liberación, el
+orden de adjudicación con exclusiones, la frontera de cancelación y su repetición,
+y el presupuesto de reintentos. Para el aviso se comprobarán la validación previa
+y la revalidación al aceptar; no se exigirá ausencia física de un log tardío si
+el consumidor ya había superado una comprobación válida.
+
+## Decisiones para el diseño técnico
+
+El [documento consolidado](docs/functional-design.md) reúne reglas, contratos,
+coordinación, tiempo, FIFO, mensajería, alternativas, pruebas previstas y
+trazabilidad hasta Q26. La [referencia técnica](docs/technical-design.md) remite
+a ese documento y recoge cómo reanudar `to-spec` tras limpiar el contexto.
+
+Habrá un único relay habilitado por configuración y consumidores replicables,
+sin elección de líder, bloqueo asesor ni relevo automático en la demo. El relay
+publicará secuencialmente y conservará una próxima fecha durable tras un fallo,
+permitiendo avanzar a otras publicaciones listas cuya ruta funcione.
+
+Un rechazo válido guardará un único `SlotReleased`, que ya activa la revisión
+completa del ámbito. No añadirá otra solicitud por ese mismo rechazo. Una
+admisión real sin liberación que cubra su activación guardará
+`AllocationReviewRequested` en la misma transacción.
+
+Q17 conserva un límite físico finito en RabbitMQ y exige traslado seguro a DLQ
+mediante `at-least-once`, `reject-publish` y DLX configurado. El presupuesto lógico
+de PostgreSQL se mantiene separado; ambos motivos de aparcado serán recuperables.
+La configuración y sus pruebas son trabajo pendiente, sin otra tecnología.
+
+Q21 conserva los registros técnicos durante toda la vida de la demo, sin purgas
+automáticas. Q22 hace prevalecer la caducidad al intentar cancelar un bloqueo
+vencido y conserva las cancelaciones válidas anteriores. Q23 permite retirarse de
+una inscripción ya cerrada sin alterar su causa, una cita confirmada ni una
+reincorporación posterior.
+
+Q25 hace prevalecer el estado actual en una confirmación repetida: `200` si la
+reserva sigue `CONFIRMED`, o `409` con su identificación y estado `CANCELLED` si
+después fue cancelada. No se repiten efectos ni se extiende a estas transiciones
+sin clave la recuperación histórica inmutable de las creaciones.
+
+Q26 diferencia en las consultas propias el estado persistido y la evaluación
+temporal de PostgreSQL: vencimiento, cierre pendiente y acciones ya no permitidas.
+Los GET no escriben ni emiten eventos; una `CONFIRMED` no caduca por su viejo plazo.
+
+El grilling está cerrado para el alcance acordado hasta Q26. Los criterios
+AC59–AC64 cubren el bloqueo propio, otros ámbitos, vencimiento durante la espera,
+replays e inscripción existente y la convivencia permitida. AC65–AC67 cubren
+Q25–Q26; AC68–AC69 hacen visibles límites ya aceptados de Q24 y del aviso.
+La implementación funcional, la configuración de negocio y esas pruebas siguen
+pendientes.
+Los comandos siguientes corresponden a la preparación técnica actual.
+
 ## Arranque con un comando
 
 Requisitos: Docker con el motor en ejecución y Docker Compose. En macOS puede usarse

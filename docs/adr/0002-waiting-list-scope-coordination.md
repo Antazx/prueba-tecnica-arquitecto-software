@@ -1,0 +1,5 @@
+# Coordinar las escrituras por ámbito de lista de espera
+
+La prioridad de la lista relaciona distintos huecos e inscripciones: proteger solo el hueco no resuelve las carreras entre altas, liberaciones y recuperaciones de elegibilidad. Todas las modificaciones adquirirán el bloqueo de una fila estable del hospital y tipo de prueba como primer bloqueo de negocio, después de la coordinación técnica de idempotencia cuando corresponda, y revalidarán estado y tiempo dentro de una transacción corta. Se acepta la serialización breve del ámbito frente a un protocolo más fino por hueco e inscripción, por su menor coste de razonamiento y verificación para el ejercicio; ámbitos distintos podrán avanzar independientemente y las restricciones de unicidad aportarán una defensa adicional.
+
+La nueva admisión aplica bajo esa coordinación el orden de Q2 revisada y Q24 del [diseño consolidado](../functional-design.md). El aislamiento y las consultas concretos deben justificar las lecturas vigentes tras esperar; este ADR no fija por sí solo un nivel de aislamiento ni una prohibición global de coexistencia entre bloqueo e inscripción.
