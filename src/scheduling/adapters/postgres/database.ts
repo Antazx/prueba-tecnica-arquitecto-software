@@ -12,7 +12,7 @@ export function createDatabasePool(connectionString: string) {
 
 export async function checkDatabase(pool: Pool): Promise<void> {
   const result = await pool.query<{ ready: boolean }>(
-    "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'scheduling') AS ready",
+    "SELECT validated AS ready FROM scheduling.demo_seed WHERE singleton",
   );
-  if (!result.rows[0]?.ready) throw new Error("The scheduling schema is not initialized");
+  if (!result.rows[0]?.ready) throw new Error("The scheduling agenda is not initialized and validated");
 }

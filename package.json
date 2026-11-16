@@ -9,6 +9,9 @@
     "node": ">=26.13.1 <27"
   },
   "scripts": {
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
+    "test": "vitest run test/unit",
+    "test:integration": "vitest run test/integration",
     "build": "tsc",
     "start:api": "node --env-file-if-exists=.env dist/bootstrap/api.js",
     "start:worker": "node --env-file-if-exists=.env dist/bootstrap/worker.js",
@@ -24,6 +27,7 @@
   "devDependencies": {
     "@types/node": "26.6.6",
     "@types/pg": "8.23.1",
-    "typescript": "6.0.3"
+    "typescript": "6.0.3",
+    "vitest": "5.1.0"
   }
 }
