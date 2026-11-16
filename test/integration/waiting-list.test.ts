@@ -6,7 +6,7 @@ import { initializeDatabase } from "../../src/scheduling/adapters/postgres/initi
 import { listSlots } from "../../src/scheduling/adapters/postgres/slots.ts";
 import { postgresScheduling } from "../../src/scheduling/adapters/postgres/scheduling.ts";
 import { schedulingUseCases } from "../../src/scheduling/application/reservations.ts";
-import { readApiContract, expectContractResponse } from "../helpers/openapi.ts";
+import { readApiContract, expectContractResponse, type ApiDocument } from "../helpers/openapi.ts";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (!databaseUrl) throw new Error("TEST_DATABASE_URL is required; use an isolated test database");
@@ -14,12 +14,24 @@ const pool = createDatabasePool(databaseUrl);
 const api = buildApi(() => Promise.resolve(), (query) => listSlots(pool, query), schedulingUseCases(postgresScheduling(pool)));
 const scope = { hospitalId: "wait-test-hospital", testTypeId: "mri" };
 const headers = { "x-patient-id": "patient-ana" };
-const join = (key: string, patientId = "patient-ana", body = scope) => api.inject({ method: "POST", url: "/waiting-list-entries",
-  headers: { "x-patient-id": patientId, "idempotency-key": key }, payload: body });
-const get = (id: string, patientId = "patient-ana") => api.inject({ url: `/waiting-list-entries/${id}`, headers: { "x-patient-id": patientId } });
-const withdraw = (id: string) => api.inject({ method: "POST", url: `/waiting-list-entries/${id}/withdraw`, headers });
+let document: ApiDocument;
+const join = async (key: string, patientId = "patient-ana", body = scope) => {
+  const response = await api.inject({ method: "POST", url: "/waiting-list-entries", headers: { "x-patient-id": patientId, "idempotency-key": key }, payload: body });
+  expectContractResponse(document, "POST", "/waiting-list-entries", response);
+  return response;
+};
+const get = async (id: string, patientId = "patient-ana") => {
+  const response = await api.inject({ url: `/waiting-list-entries/${id}`, headers: { "x-patient-id": patientId } });
+  expectContractResponse(document, "GET", "/waiting-list-entries/{id}", response);
+  return response;
+};
+const withdraw = async (id: string) => {
+  const response = await api.inject({ method: "POST", url: `/waiting-list-entries/${id}/withdraw`, headers });
+  expectContractResponse(document, "POST", "/waiting-list-entries/{id}/withdraw", response);
+  return response;
+};
 
-beforeAll(async () => { await initializeDatabase(pool); });
+beforeAll(async () => { await initializeDatabase(pool); document = await readApiContract(api); });
 beforeEach(async () => {
   await pool.query("INSERT INTO scheduling.hospitals VALUES ($1) ON CONFLICT DO NOTHING", [scope.hospitalId]);
   await pool.query("INSERT INTO scheduling.waiting_list_scopes VALUES ($1, $2) ON CONFLICT DO NOTHING", [scope.hospitalId, scope.testTypeId]);
@@ -197,6 +209,8 @@ it.each(["ACCEPTED", "EXPIRED", "WITHDRAWN"])("preserves closed cause %s and lea
   const old = await withdraw(first.json().id);
   expect(old.statusCode).toBe(200);
   expect(old.json()).toMatchObject({ state: "CLOSED", closureReason: reason });
+  expect((await get(first.json().id)).json()).toMatchObject({ state: "CLOSED", closureReason: reason });
+  expect(old.json()).not.toHaveProperty("offer");
   expect((await get(second.json().id)).json().state).toBe("WAITING");
   expect((await pool.query("SELECT state FROM scheduling.reservations WHERE id=$1", [reservationId])).rows[0].state).toBe("CONFIRMED");
 });
@@ -214,6 +228,7 @@ it("uses a read-only coherent GET with no invented expiry for waiting and enforc
     expect(response.json()).toMatchObject({ state: "WAITING", temporal: { expired: false, closurePending: false }, actions: { canWithdraw: true } });
     expect(response.json().evaluatedAt).toMatch(/\.\d{3}Z$/);
     expect(response.json().expiresAt).toBeUndefined();
+    expectContractResponse(await readApiContract(readOnlyApi), "GET", "/waiting-list-entries/{id}", response);
   } finally { await readOnlyApi.close(); await reader.end(); }
   await expect(pool.query(`INSERT INTO scheduling.waiting_list_entries(id, patient_id, hospital_id, test_type_id, admission_order, state, created_at)
     SELECT $1, patient_id, hospital_id, test_type_id, 2, 'WAITING', created_at FROM scheduling.waiting_list_entries WHERE id=$2`, [randomUUID(), initial.json().id]))
@@ -256,6 +271,7 @@ it.each([
     const response = await failingApi.inject({ method: "POST", url: "/waiting-list-entries", headers: { ...headers, "idempotency-key": "wait-test-rollback" }, payload: scope });
     expect(response.statusCode).toBe(500);
     expect(response.json()).toEqual({ code: "INTERNAL_ERROR" });
+    expectContractResponse(await readApiContract(failingApi), "POST", "/waiting-list-entries", response);
     expect((await pool.query("SELECT count(*)::integer AS count FROM scheduling.waiting_list_entries WHERE hospital_id=$1", [scope.hospitalId])).rows[0].count).toBe(normalized ? 1 : 0);
     expect((await pool.query("SELECT count(*)::integer AS count FROM scheduling.events WHERE payload->>'hospitalId'=$1", [scope.hospitalId])).rows[0].count).toBe(normalized ? 1 : 0);
     expect((await pool.query("SELECT count(*)::integer AS count FROM scheduling.http_creation_results WHERE idempotency_key='wait-test-rollback'")).rows[0].count).toBe(0);
@@ -279,6 +295,22 @@ it.each([
 ])("validates identity, key and scope without accepting contradictory ownership %#", async ({ identity, key, body }) => {
   const response = await api.inject({ method: "POST", url: "/waiting-list-entries", headers: { "x-patient-id": identity, "idempotency-key": key }, payload: body });
   expect(response.statusCode).toBe(400);
+  expectContractResponse(document, "POST", "/waiting-list-entries", response);
+});
+
+it("distinguishes an unknown admission scope from an unknown patient and hides missing entries", async () => {
+  const missingScope = await join("wait-test-missing-scope", "patient-ana", { ...scope, hospitalId: "missing-hospital" });
+  expect(missingScope.statusCode).toBe(404);
+  expect(missingScope.json()).toEqual({ code: "NOT_FOUND" });
+  const missingPatient = await join("wait-test-missing-patient", "unknown", { ...scope, hospitalId: "missing-hospital" });
+  expect(missingPatient.statusCode).toBe(400);
+  expect(missingPatient.json()).toEqual({ code: "UNKNOWN_PATIENT" });
+  const missing = await get("missing-entry");
+  expect(missing.statusCode).toBe(404);
+  expect(missing.json()).toEqual({ code: "NOT_FOUND" });
+  const unknownReader = await get("missing-entry", "unknown");
+  expect(unknownReader.statusCode).toBe(400);
+  expect(unknownReader.json()).toEqual({ code: "UNKNOWN_PATIENT" });
 });
 
 it("returns an existing entry before normalizing foreign expiries and preserves own live hold", async () => {

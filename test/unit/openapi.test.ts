@@ -21,6 +21,52 @@ function schedulingApi() {
   return app;
 }
 
+it("publishes offer rejection with reservation-shaped expiry and state conflicts", async () => {
+  const document = await readApiContract(schedulingApi());
+  const operation = document.paths["/reservations/{id}/reject"]?.post;
+  expect(operation).toBeDefined();
+  expect(operation).not.toHaveProperty("requestBody");
+  expect(operation.parameters?.map(({ name, in: location }) => `${location}:${name}`).sort()).toEqual(["header:x-patient-id", "path:id"]);
+  expect(Object.keys(operation.responses).sort()).toEqual(["200", "400", "404", "409", "500", "503"]);
+  expect(operation.responses["200"].content!["application/json"].schema).toMatchObject({ properties: { state: { enum: ["CANCELLED"] } } });
+  expect(operation.responses["409"].content!["application/json"].schema).toMatchObject({
+    oneOf: ["EXPIRED", "HELD", "CONFIRMED", "CANCELLED"].map((state) => ({
+      additionalProperties: false, required: expect.arrayContaining(["id", "slotId", "state", "createdAt", "expiresAt", "startsAt", "endsAt", "code"]),
+      properties: { state: { enum: [state] }, code: { enum: [state === "EXPIRED" ? "RESERVATION_EXPIRED" : "RESERVATION_STATE_CONFLICT"] } },
+    })),
+  });
+});
+
+it("publishes withdrawal without a body or key and preserves all terminal causes", async () => {
+  const document = await readApiContract(schedulingApi());
+  const operation = document.paths["/waiting-list-entries/{id}/withdraw"]?.post;
+  expect(operation).toBeDefined();
+  expect(operation).not.toHaveProperty("requestBody");
+  expect(operation.parameters?.map(({ name, in: location }) => `${location}:${name}`).sort()).toEqual(["header:x-patient-id", "path:id"]);
+  expect(Object.keys(operation.responses).sort()).toEqual(["200", "400", "404", "500", "503"]);
+  expect(operation.responses["200"].content!["application/json"].schema).toMatchObject({
+    required: expect.arrayContaining(["id", "hospitalId", "testTypeId", "admissionOrder", "state", "createdAt", "excludedSlotIds", "closureReason"]),
+    additionalProperties: false, properties: { state: { enum: ["CLOSED"] }, closureReason: { enum: ["ACCEPTED", "EXPIRED", "WITHDRAWN"] } },
+  });
+  expect(operation.responses["200"].content!["application/json"].schema).not.toHaveProperty("properties.offer");
+});
+
+it("publishes waiting entry reads with optional offer, closure cause and temporal actions", async () => {
+  const document = await readApiContract(schedulingApi());
+  const operation = document.paths["/waiting-list-entries/{id}"]?.get;
+  expect(operation).toBeDefined();
+  expect(operation).not.toHaveProperty("requestBody");
+  expect(Object.keys(operation.responses).sort()).toEqual(["200", "400", "404", "500", "503"]);
+  expect(operation.parameters?.map(({ name, in: location }) => `${location}:${name}`).sort()).toEqual(["header:x-patient-id", "path:id"]);
+  expect(operation.responses["200"].content!["application/json"].schema).toMatchObject({
+    oneOf: [
+      { required: expect.arrayContaining(["id", "admissionOrder", "evaluatedAt", "temporal", "actions"]), additionalProperties: false, properties: { state: { enum: ["WAITING"] } } },
+      { required: expect.arrayContaining(["offer", "evaluatedAt", "temporal", "actions"]), additionalProperties: false, properties: { state: { enum: ["OFFERED"] } } },
+      { required: expect.arrayContaining(["closureReason", "evaluatedAt", "temporal", "actions"]), additionalProperties: false, properties: { state: { enum: ["CLOSED"] }, closureReason: { enum: ["ACCEPTED", "EXPIRED", "WITHDRAWN"] } } },
+    ],
+  });
+});
+
 it("publishes the current reservation query with synthetic identity and evaluated temporal state", async () => {
   const document = await readApiContract(schedulingApi());
   const operation = document.paths["/reservations/{id}"]?.get;
@@ -96,7 +142,7 @@ it("publishes hold creation headers, no body and only its applicable responses",
 it.each([
   { error: Object.assign(new Error("Synthetic PostgreSQL connection failure"), { code: "ECONNREFUSED" }), status: 503, code: "DEPENDENCY_UNAVAILABLE" },
   { error: new Error("Synthetic unexpected database failure"), status: 500, code: "INTERNAL_ERROR" },
-])("validates reservation route errors at the database boundary: $status/$code", async ({ error, status, code }) => {
+])("validates every scheduling route error at the database boundary: $status/$code", async ({ error, status, code }) => {
   const pool = createDatabasePool("postgresql://synthetic:synthetic@127.0.0.1:1/synthetic");
   vi.spyOn(pool, "connect").mockRejectedValue(error);
   vi.spyOn(pool, "query").mockRejectedValue(error);
@@ -109,8 +155,12 @@ it.each([
       { method: "GET", path: "/reservations/{id}", url: "/reservations/10000000-0000-4000-8000-000000000001" },
       { method: "POST", path: "/reservations/{id}/confirm", url: "/reservations/10000000-0000-4000-8000-000000000001/confirm" },
       { method: "POST", path: "/reservations/{id}/cancel", url: "/reservations/10000000-0000-4000-8000-000000000001/cancel" },
+      { method: "POST", path: "/reservations/{id}/reject", url: "/reservations/10000000-0000-4000-8000-000000000001/reject" },
+      { method: "POST", path: "/waiting-list-entries", url: "/waiting-list-entries" },
+      { method: "GET", path: "/waiting-list-entries/{id}", url: "/waiting-list-entries/20000000-0000-4000-8000-000000000001" },
+      { method: "POST", path: "/waiting-list-entries/{id}/withdraw", url: "/waiting-list-entries/20000000-0000-4000-8000-000000000001/withdraw" },
     ] as const) {
-      const response = await app.inject({ method, url, headers: { "x-patient-id": "patient-ana", "idempotency-key": "synthetic-error" } });
+      const response = await app.inject({ method, url, headers: { "x-patient-id": "patient-ana", "idempotency-key": "synthetic-error" }, payload: path === "/waiting-list-entries" ? { hospitalId: "hospital-south", testTypeId: "mri" } : undefined });
       expect(response.statusCode, path).toBe(status);
       expect(response.json()).toEqual({ code });
       expectContractResponse(document, method, path, response);
@@ -118,7 +168,7 @@ it.each([
   } finally { vi.restoreAllMocks(); await pool.end(); }
 });
 
-it("preserves invalid identity and path responses on every documented reservation operation", async () => {
+it("preserves invalid identity and path responses on every identified scheduling resource", async () => {
   const app = schedulingApi();
   const document = await readApiContract(app);
   for (const { method, path, url } of [
@@ -126,6 +176,9 @@ it("preserves invalid identity and path responses on every documented reservatio
     { method: "GET", path: "/reservations/{id}", url: "/reservations/ID" },
     { method: "POST", path: "/reservations/{id}/confirm", url: "/reservations/ID/confirm" },
     { method: "POST", path: "/reservations/{id}/cancel", url: "/reservations/ID/cancel" },
+    { method: "POST", path: "/reservations/{id}/reject", url: "/reservations/ID/reject" },
+    { method: "GET", path: "/waiting-list-entries/{id}", url: "/waiting-list-entries/ID" },
+    { method: "POST", path: "/waiting-list-entries/{id}/withdraw", url: "/waiting-list-entries/ID/withdraw" },
   ] as const) {
     for (const headers of [{}, { "x-patient-id": "invalid patient" }, { "x-patient-id": "x".repeat(101) }]) {
       const response = await app.inject({ method, url, headers: { ...headers, "idempotency-key": "synthetic-invalid" } });
@@ -137,6 +190,32 @@ it("preserves invalid identity and path responses on every documented reservatio
     expect(response.statusCode, path).toBe(400);
     expect(response.json()).toEqual({ code: "INVALID_REQUEST" });
     expectContractResponse(document, method, path, response);
+  }
+});
+
+it("preserves waiting list creation validation for identity, keys, JSON scope and content type", async () => {
+  const app = schedulingApi();
+  const document = await readApiContract(app);
+  const headers = { "x-patient-id": "patient-ana", "idempotency-key": "demo-wait-1" };
+  const scope = { hospitalId: "hospital-south", testTypeId: "mri" };
+  for (const request of [
+    { headers: { "idempotency-key": "demo-wait-1" }, payload: scope },
+    { headers: { ...headers, "x-patient-id": "invalid patient" }, payload: scope },
+    { headers: { "x-patient-id": "patient-ana" }, payload: scope },
+    { headers: { ...headers, "idempotency-key": "invalid key" }, payload: scope },
+    { headers: { ...headers, "idempotency-key": "x".repeat(201) }, payload: scope },
+    { headers },
+    { headers, payload: { hospitalId: "hospital-south" } },
+    { headers, payload: { ...scope, patientId: "patient-bruno" } },
+    { headers, payload: { ...scope, testTypeId: 1 } },
+    { headers, payload: { ...scope, hospitalId: "invalid hospital" } },
+    { headers: { ...headers, "content-type": "application/json" }, payload: "{" },
+    { headers: { ...headers, "content-type": "application/xml" }, payload: "<scope/>" },
+  ]) {
+    const response = await app.inject({ method: "POST", url: "/waiting-list-entries", ...request });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ code: "INVALID_REQUEST" });
+    expectContractResponse(document, "POST", "/waiting-list-entries", response);
   }
 });
 
@@ -223,7 +302,7 @@ it.each([
   expectContractResponse(document, "GET", "/slots", response);
 });
 
-it("tracks the seven documented operations against the complete registered public API", async () => {
+it("covers all eleven operations against the independent complete public route inventory", async () => {
   const app = schedulingApi();
   const inventory = captureApiRoutes(app);
   const document = await readApiContract(app);
@@ -231,11 +310,12 @@ it("tracks the seven documented operations against the complete registered publi
     "GET /health/live", "GET /health/ready", "GET /slots",
     "GET /reservations/{id}", "POST /slots/{id}/holds",
     "POST /reservations/{id}/cancel", "POST /reservations/{id}/confirm",
-  ], [
     "GET /waiting-list-entries/{id}", "POST /reservations/{id}/reject",
     "POST /waiting-list-entries", "POST /waiting-list-entries/{id}/withdraw",
   ]);
-  expect(inventory.derivedHeads).toEqual(expect.arrayContaining(["HEAD /health/live", "HEAD /health/ready", "HEAD /slots"]));
+  expect([...inventory.derivedHeads].sort()).toEqual(["HEAD /health/live", "HEAD /health/ready", "HEAD /reservations/{id}", "HEAD /slots", "HEAD /waiting-list-entries/{id}"]);
+  expect(inventory.artifacts).toContain("GET /openapi.json");
+  expect(inventory.artifacts).toContain("GET /docs");
 });
 
 it("rejects broken references and malformed schemas in the downloaded document", async () => {
@@ -267,15 +347,24 @@ it("fails response checks for undeclared status, content type and incompatible b
 it("does not exclude an independent HEAD or an unplanned public operation from coverage", async () => {
   const app = api();
   const inventory = captureApiRoutes(app);
-  app.head("/independent-head", async (_request, reply) => reply.header("x-synthetic", "yes").send());
-  app.get("/unplanned-operation", async () => ({ status: "synthetic" }));
+  app.register(async (routes) => {
+    routes.head("/independent-head", async (_request, reply) => reply.header("x-synthetic", "yes").send());
+    routes.get("/unplanned-operation", async () => ({ status: "synthetic" }));
+  });
   const document = await readApiContract(app);
   expect(inventory.operations).toContain("HEAD /independent-head");
   expect(inventory.operations).toContain("GET /unplanned-operation");
+  expect(document.paths["/unplanned-operation"]?.get).toBeDefined();
   expect(() => expectContractCoverage(document, inventory, ["GET /health/live", "GET /health/ready", "GET /slots"])).toThrow();
-  const missingOperation = structuredClone(document);
-  delete missingOperation.paths["/slots"];
-  expect(() => expectContractCoverage(missingOperation, inventory, ["GET /health/live", "GET /health/ready", "GET /slots"])).toThrow();
+});
+
+it("rejects a missing documented route even when the public inventory is unchanged", async () => {
+  const app = api();
+  const inventory = captureApiRoutes(app);
+  const document = await readApiContract(app);
+  expectContractCoverage(document, inventory, ["GET /health/live", "GET /health/ready", "GET /slots"]);
+  delete document.paths["/slots"];
+  expect(() => expectContractCoverage(document, inventory, ["GET /health/live", "GET /health/ready", "GET /slots"])).toThrow();
 });
 
 it("publishes the required agenda parameters with their real restrictions and temporal meaning", async () => {

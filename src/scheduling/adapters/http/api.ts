@@ -4,6 +4,7 @@ import swaggerUi from "@fastify/swagger-ui";
 import { agendaSchema } from "./agenda-schema.ts";
 import { liveSchema, readySchema } from "./health-schemas.ts";
 import { holdSchema, getReservationSchema, confirmReservationSchema, cancelReservationSchema, reservationSchema, heldReservationSchema, confirmedReservationSchema, cancelledReservationSchema, reservationEvaluationSchema } from "./reservation-schemas.ts";
+import { activeWaitingListEntrySchema, newWaitingListEntrySchema, joinWaitingListSchema, getWaitingListEntrySchema, waitingListEntryEvaluationSchema, closedWaitingListEntrySchema, withdrawWaitingListEntrySchema, rejectOfferSchema } from "./waiting-list-schemas.ts";
 import type { AgendaReader } from "../../application/agenda.ts";
 import { parseExternalInstant } from "../../domain/instant.ts";
 import type { SchedulingUseCases } from "../../application/reservations.ts";
@@ -27,7 +28,6 @@ export function buildApi(checkPostgres: () => Promise<void>, readAgenda: AgendaR
   });
 
   api.register(swagger, {
-    hideUntagged: true,
     openapi: {
       openapi: "3.2.1",
       info: { title: "Citación de pruebas diagnósticas", version: "0.1.0", description: "API de demostración con datos exclusivamente sintéticos." },
@@ -47,29 +47,25 @@ export function buildApi(checkPostgres: () => Promise<void>, readAgenda: AgendaR
       api.addSchema(reservationEvaluationSchema);
       api.addSchema(confirmedReservationSchema);
       api.addSchema(cancelledReservationSchema);
-      const id = { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$" };
-      const patientHeaders = { type: "object", required: ["x-patient-id"], properties: { "x-patient-id": id } };
-      const params = { type: "object", required: ["id"], properties: { id }, additionalProperties: false };
+      api.addSchema(newWaitingListEntrySchema);
+      api.addSchema(activeWaitingListEntrySchema);
+      api.addSchema(waitingListEntryEvaluationSchema);
+      api.addSchema(closedWaitingListEntrySchema);
       api.get<{ Params: { id: string }; Headers: { "x-patient-id": string } }>("/waiting-list-entries/:id", {
-        schema: { params, headers: patientHeaders },
+        schema: getWaitingListEntrySchema,
       }, async (request, reply) => {
         const result = await scheduling.getWaitingListEntry(request.headers["x-patient-id"], request.params.id);
         return reply.code(result.status).send(result.body);
       });
       api.post<{ Params: { id: string }; Headers: { "x-patient-id": string } }>("/waiting-list-entries/:id/withdraw", {
-        schema: { params, headers: patientHeaders },
+        schema: withdrawWaitingListEntrySchema,
       }, async (request, reply) => {
         if (request.body !== undefined) return reply.code(400).send({ code: "BODY_NOT_ALLOWED" });
         const result = await scheduling.withdrawWaitingListEntry(request.headers["x-patient-id"], request.params.id);
         return reply.code(result.status).send(result.body);
       });
       api.post<{ Body: { hospitalId: string; testTypeId: string }; Headers: { "x-patient-id": string; "idempotency-key": string } }>("/waiting-list-entries", {
-        schema: {
-          headers: { ...patientHeaders, required: ["x-patient-id", "idempotency-key"], properties: {
-            ...patientHeaders.properties, "idempotency-key": { type: "string", minLength: 1, maxLength: 200, pattern: "^[!-~]+$" },
-          } },
-          body: { type: "object", required: ["hospitalId", "testTypeId"], properties: { hospitalId: id, testTypeId: id }, additionalProperties: false },
-        },
+        schema: joinWaitingListSchema,
       }, async (request, reply) => {
         const result = await scheduling.joinWaitingList(request.headers["x-patient-id"], request.body, request.headers["idempotency-key"]);
         return reply.code(result.status).send(result.body);
@@ -90,7 +86,7 @@ export function buildApi(checkPostgres: () => Promise<void>, readAgenda: AgendaR
         return reply.code(result.status).send(result.body);
       });
       api.post<{ Params: { id: string }; Headers: { "x-patient-id": string } }>("/reservations/:id/reject", {
-        schema: { params, headers: patientHeaders },
+        schema: rejectOfferSchema,
       }, async (request, reply) => {
         if (request.body !== undefined) return reply.code(400).send({ code: "BODY_NOT_ALLOWED" });
         const result = await scheduling.rejectOffer(request.headers["x-patient-id"], request.params.id);

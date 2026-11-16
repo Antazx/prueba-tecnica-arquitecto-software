@@ -19,11 +19,19 @@ export interface ApiDocument extends Record<string, unknown> {
   paths: Record<string, Record<string, Operation>>;
 }
 
-export async function readApiContract(api: FastifyInstance) {
-  const response = await api.inject({ url: "/openapi.json" });
-  expect(response.statusCode).toBe(200);
-  expect(response.headers["content-type"]).toContain("application/json");
-  const document = response.json<ApiDocument>();
+export async function readApiContract(api: FastifyInstance | string) {
+  let document: ApiDocument;
+  if (typeof api === "string") {
+    const response = await fetch(`${api}/openapi.json`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("application/json");
+    document = await response.json() as ApiDocument;
+  } else {
+    const response = await api.inject({ url: "/openapi.json" });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-type"]).toContain("application/json");
+    document = response.json<ApiDocument>();
+  }
   expect(document.openapi).toBe("3.2.1");
   return validateApiDocument(document);
 }
@@ -53,7 +61,7 @@ export async function validateApiDocument(document: ApiDocument) {
   return resolved;
 }
 
-export function expectContractResponse(document: ApiDocument, method: string, path: string, response: LightMyRequestResponse) {
+export function expectContractResponse(document: ApiDocument, method: string, path: string, response: Pick<LightMyRequestResponse, "statusCode" | "headers" | "json">) {
   const operation = document.paths[path]?.[method.toLowerCase()];
   expect(operation, `${method} ${path} must be documented`).toBeDefined();
   const declared = operation.responses[String(response.statusCode)];
@@ -65,6 +73,14 @@ export function expectContractResponse(document: ApiDocument, method: string, pa
   addFormats(ajv);
   const validate = ajv.compile(schema!);
   expect(validate(response.json()), JSON.stringify(validate.errors)).toBe(true);
+}
+
+export async function expectNetworkContractResponse(document: ApiDocument, method: string, path: string, response: Response) {
+  const body = await response.json();
+  expectContractResponse(document, method, path, {
+    statusCode: response.status, headers: { "content-type": response.headers.get("content-type") ?? "" }, json: () => body,
+  });
+  return body;
 }
 
 export function captureApiRoutes(api: FastifyInstance) {
@@ -92,11 +108,11 @@ export function captureApiRoutes(api: FastifyInstance) {
   return inventory;
 }
 
-export function expectContractCoverage(document: ApiDocument, inventory: ReturnType<typeof captureApiRoutes>, covered: string[], pending: string[] = []) {
+export function expectContractCoverage(document: ApiDocument, inventory: ReturnType<typeof captureApiRoutes>, covered: string[]) {
   const methods = new Set(["get", "post", "put", "patch", "delete", "head", "options", "trace", "query"]);
   const documented = Object.entries(document.paths).flatMap(([path, item]) =>
     Object.keys(item).filter((method) => methods.has(method)).map((method) => `${method.toUpperCase()} ${path}`));
   expect(documented.sort()).toEqual([...covered].sort());
-  expect([...inventory.operations].sort()).toEqual([...covered, ...pending].sort());
-  expect(new Set([...covered, ...pending]).size).toBe(covered.length + pending.length);
+  expect([...inventory.operations].sort()).toEqual([...covered].sort());
+  expect(new Set(covered).size).toBe(covered.length);
 }
