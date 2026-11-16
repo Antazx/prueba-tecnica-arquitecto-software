@@ -2,8 +2,9 @@
 
 Implementación de la [prueba de arquitectura de software](docs/diagnostic-appointment-requirements.pdf).
 Esta entrega permite consultar una agenda sintética validada, bloquear un hueco
-con exclusividad y recuperar el resultado de creación mediante idempotencia.
-La confirmación, cancelación, caducidad automática y lista de espera corresponden
+con exclusividad, confirmar o cancelar la reserva y caducar los bloqueos desde
+el worker. Cada liberación conserva su evento y publicación pendiente en
+PostgreSQL. La lista de espera, el transporte asíncrono y los avisos corresponden
 a las siguientes entregas.
 
 ## Diseño funcional acordado
@@ -105,8 +106,9 @@ El grilling está cerrado para el alcance acordado hasta Q26. Los criterios
 AC59–AC64 cubren el bloqueo propio, otros ámbitos, vencimiento durante la espera,
 replays e inscripción existente y la convivencia permitida. AC65–AC67 cubren
 Q25–Q26; AC68–AC69 hacen visibles límites ya aceptados de Q24 y del aviso.
-Están implementados la consulta de agenda, los bloqueos y su consulta propia.
-Las transiciones posteriores, la lista de espera y la mensajería siguen pendientes.
+Están implementados la consulta de agenda, los bloqueos, su consulta propia,
+confirmación, cancelación y barrido de bloqueos vencidos con outbox. La lista de
+espera, las ofertas y la publicación/consumo de mensajería siguen pendientes.
 
 ## Arranque con un comando
 
@@ -198,8 +200,8 @@ GET añade `evaluatedAt`, `temporal.expired`, `temporal.closurePending` y `actio
 (`canConfirm`, `canCancel`, `canRejectOffer`). El estado es siempre el persistido.
 Si un temporal ha vencido, informa cierre pendiente y deshabilita las acciones,
 sin modificar filas. Una confirmada no vence por su antiguo plazo. Las acciones
-describen permisos funcionales de Q26; sus endpoints de transición se incorporan
-en las siguientes entregas. Cada POST futuro volverá a validar estado y tiempo.
+describen permisos funcionales de Q26. Confirmar y cancelar vuelven a validar
+estado y tiempo; las operaciones de oferta se incorporarán con la lista de espera.
 
 Cabecera ausente o inválida, paciente inexistente, clave ausente o cuerpo dan
 `400`; recurso inexistente o ajeno da el mismo `404 NOT_FOUND`. El POST responde
@@ -220,9 +222,60 @@ incluidas filas vencidas aún sin cerrar. Ámbitos distintos avanzan de forma
 independiente; el mismo ámbito serializa sus escrituras breves. La espera de
 bloqueos se limita a dos segundos y las sentencias a 2,5 segundos.
 
-El barrido y las liberaciones durables aún no están implementados. Un bloqueo
-vencido seguirá ocupando hasta incorporar esa transición; no se promete todavía
-el recorrido completo del enunciado ni la prioridad de lista del ticket siguiente.
+### Confirmar, cancelar y caducar bloqueos directos
+
+Las transiciones tampoco admiten cuerpo y se dirigen al ID concreto; no exigen
+`Idempotency-Key`:
+
+```bash
+curl --fail -X POST http://127.0.0.1:3000/reservations/ID_DEVUELTO/confirm \
+  -H 'X-Patient-Id: patient-ana'
+curl --fail -X POST http://127.0.0.1:3000/reservations/ID_DEVUELTO/cancel \
+  -H 'X-Patient-Id: patient-ana'
+```
+
+Confirmar un `HELD` vigente devuelve `200 CONFIRMED`, con el mismo ID y plazo
+original. Repetir mientras siga confirmada devuelve `200`, incluso pasado el
+antiguo TTL. Tras cancelarla, confirmar da `409 RESERVATION_STATE_CONFLICT` con
+el ID y el estado actual `CANCELLED`; nunca toca una reserva posterior del hueco.
+
+Cancelar un bloqueo vigente o una cita antes del inicio devuelve `200 CANCELLED`.
+La repetición de una cancelación válida sigue devolviendo `200`, incluso tras
+el inicio. Una cancelación nueva de una confirmada desde la igualdad con su
+inicio responde `409 APPOINTMENT_STARTED` y conserva la cita. `OFFERED` exige las
+operaciones de oferta y responde conflicto de estado en `/cancel`.
+
+En la igualdad con el vencimiento o después, confirmar o cancelar un `HELD`
+materializa `EXPIRED` y devuelve `409 RESERVATION_EXPIRED`. La caducidad y la
+liberación se comprometen pese a ese conflicto; repetir no crea más trabajo.
+Un fallo técnico revierte toda la transacción. El reloj es de PostgreSQL,
+obtenido tras esperar los bloqueos; no se usa el inicio de la transacción para
+conceder vigencia adicional.
+
+El worker inicializa esquema/seed con la misma coordinación que la API antes de
+barrer. Busca hasta 100 bloqueos vencidos por pasada, ordenados por vencimiento
+e ID, y revalida cada uno bajo el mismo protocolo de ámbito, hueco y reserva.
+Recupera atrasos aunque el hueco ya haya empezado; una confirmada no caduca por
+su viejo TTL. El intervalo predeterminado es tres segundos; no acredita un plazo
+máximo de liberación.
+
+Cada cierre guarda atómicamente estado, causa en `reservation_closures`, un
+`SlotReleased` v1 en `events` y una fila en `outbox_publications`. La clave única
+de cierre por reserva protege una única liberación lógica. El evento contiene
+ámbito, hueco, reserva y causa, sin datos clínicos. El ID de publicación es
+distinto del ID del evento; consumidor lógico (`allocation`), ciclo e intento
+iniciales se conservan como referencias separadas para las siguientes entregas.
+Las tablas se retienen sin purgas. La publicación no está conectada todavía:
+RabbitMQ inaccesible no impide guardar negocio y outbox, pero aún no hay revisión
+de lista ni avisos.
+
+Para acortar una demostración local puede configurarse `DIRECT_HOLD_TTL_MS` en la
+API, entre 1 y 600000 ms (predeterminado 600000). Nunca amplía el plazo de diez
+minutos y siempre se limita al inicio. `EXPIRY_SWEEP_INTERVAL_MS` configura el
+intervalo del worker, positivo y predeterminado 3000 ms. En ejecución con Node,
+estas variables pueden añadirse al `.env` local; Compose conserva los valores
+predeterminados. No se promete todavía el recorrido completo ni la prioridad
+de lista del ticket siguiente.
 
 ## Disponibilidad y recuperación
 
@@ -234,8 +287,9 @@ el recorrido completo del enunciado ni la prioridad de lista del ticket siguient
 | Worker | `GET /health/ready` en su puerto interno 3001 | PostgreSQL y RabbitMQ accesibles |
 
 La API no abre una conexión AMQP. Puede seguir disponible durante una caída del
-broker, coherentemente con el outbox que se implementará después. El worker revisa
-PostgreSQL cada tres segundos y vuelve a conectar a RabbitMQ tras una desconexión.
+broker; la outbox permanece pendiente. El worker barre bloqueos aunque RabbitMQ
+esté inaccesible, revisa PostgreSQL cada tres segundos de forma predeterminada y
+vuelve a conectar a RabbitMQ tras una desconexión.
 Una dependencia no disponible produce estado HTTP 503; el proceso sigue vivo para
 recuperarse. Ambos procesos cierran sus recursos al recibir `SIGINT` o `SIGTERM`.
 
@@ -243,8 +297,8 @@ recuperarse. Ambos procesos cierran sus recursos al recibir `SIGINT` o `SIGTERM`
 docker compose logs --follow api worker
 ```
 
-El worker todavía no consume trabajos de citación. Mantiene las conexiones y
-expone su estado para comprobar la preparación técnica.
+El worker todavía no publica ni consume trabajos de outbox. Ya ejecuta el barrido
+de bloqueos directos y conserva las conexiones y su estado de disponibilidad.
 
 ## Desarrollo local
 
@@ -305,9 +359,16 @@ pools propios y usa una conexión controladora que retiene el ámbito; un observ
 verifica esperas reales y sus cadenas con `pg_stat_activity`/`pg_blocking_pids`
 antes de soltarlo. Cubre tres pacientes competidores, ámbitos independientes,
 misma clave entre instancias, respuesta no leída y cruce del inicio durante la
-espera. Un fallo SQL por permisos en la escritura final del resultado acredita
-rollback de reserva y clave, y permite reintentar. El usuario SQL de esta base
-aislada debe poder crear y eliminar el rol temporal de esa prueba.
+espera. Las transiciones añaden carreras de confirmación/cancelación/barrido,
+cruce real del vencimiento tras la barrera y un orden forzado donde el worker
+vence primero. Las fronteras exactas de igualdad y 1 ms se comprueban en reglas
+puras con tiempo explícito, sin atribuir fake timers de JavaScript a PostgreSQL.
+Los fallos SQL por permisos en la escritura final del resultado o de outbox
+acreditan rollback completo y permiten reintentar. El usuario SQL de esta base
+aislada debe poder crear/eliminar roles temporales y crear bases de pruebas.
+La prueba del worker arranca API y worker sobre otra base vacía, usa un TTL
+acortado, conserva la liberación con AMQP inaccesible y comprueba retención de la
+outbox al reiniciar el worker.
 También comprueba reinicialización, rechazo de solapamientos, restricciones,
 titularidad sintética, plazos, replay, lectura conservadora, unicidad con ocupante
 vencido y clasificación de fallos. `pnpm typecheck` comprueba
@@ -330,6 +391,8 @@ conexiones internas mediante los nombres `postgres` y `rabbitmq`.
 | `HOST` | Dirección de escucha; `127.0.0.1` local y `0.0.0.0` dentro del contenedor |
 | `API_PORT` | Puerto de la API; 3000 por defecto |
 | `WORKER_HEALTH_PORT` | Comprobaciones del worker local; 3001 por defecto |
+| `DIRECT_HOLD_TTL_MS` | TTL de bloqueo de la API; 600000 por defecto, entre 1 y 600000 ms |
+| `EXPIRY_SWEEP_INTERVAL_MS` | Intervalo positivo de barrido del worker; 3000 ms por defecto |
 | `POSTGRES_PORT`, `RABBITMQ_PORT` | Puertos publicados por Compose; 5432 y 5672 por defecto |
 
 Si cambias un puerto publicado de PostgreSQL o RabbitMQ, ajusta también la URL
@@ -337,11 +400,13 @@ correspondiente del modo local. Los servicios de Compose conservan sus puertos
 internos. La API de Compose escucha internamente en 3000.
 
 PostgreSQL conserva su volumen entre arranques. `db/schema.sql` define hospitales,
-tipos, recursos, pacientes sintéticos, ámbitos, huecos, reservas y resultados de
-creación, con claves que impiden mezclar ámbitos y restricciones que exigen
-intervalos no vacíos, milisegundos y un ocupante por hueco.
-La API ejecuta esquema y seed en una transacción de inicialización coordinada,
-valida automáticamente la agenda completa y solo después empieza a escuchar.
+tipos, recursos, pacientes sintéticos, ámbitos, huecos, reservas, resultados de
+creación, causas de cierre, eventos y publicaciones de outbox, con claves que
+impiden mezclar ámbitos y restricciones que exigen intervalos no vacíos,
+milisegundos y un ocupante por hueco.
+API y worker ejecutan esquema y seed en una transacción de inicialización
+coordinada, validan automáticamente la agenda completa y solo después sirven
+negocio o ejecutan el barrido.
 Una agenda solapada de un mismo recurso impide arrancar la API. El worker exige
 la marca de validación para anunciar disponibilidad. RabbitMQ tiene su propio
 volumen y un nombre de nodo estable.
@@ -356,8 +421,8 @@ ese límite no restringe el endpoint. Tras pasar sus fechas, la agenda deja de
 tener huecos futuros: para otra demostración se requiere la recreación explícita
 del entorno sintético, no un reinicio normal.
 
-Los scripts SQL de PostgreSQL se ejecutan sobre un volumen vacío; además la API
-los aplica de forma idempotente antes de servir. No se ofrecen migraciones de
+Los scripts SQL de PostgreSQL se ejecutan sobre un volumen vacío; además API y worker
+los aplican de forma idempotente antes de servir. No se ofrecen migraciones de
 bases pobladas. Para recrear explícitamente toda la demo, el siguiente
 comando elimina los volúmenes y sus datos locales:
 

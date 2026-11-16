@@ -9,7 +9,7 @@ import { schedulingUseCases } from "../scheduling/application/reservations.ts";
 async function main() {
   const config = readApiConfig();
   const pool = createDatabasePool(config.databaseUrl);
-  const api = buildApi(() => checkDatabase(pool), (query) => listSlots(pool, query), schedulingUseCases(postgresScheduling(pool)));
+  const api = buildApi(() => checkDatabase(pool), (query) => listSlots(pool, query), schedulingUseCases(postgresScheduling(pool), { holdTtlMs: config.holdTtlMs }));
   pool.on("error", (error) => api.log.warn({ err: error }, "PostgreSQL connection lost"));
 
   let stopping = false;

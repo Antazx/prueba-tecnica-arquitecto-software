@@ -1,9 +1,11 @@
+import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import type { CreationIdentity, CreationResult, Reservation, Scheduling, SchedulingTransaction } from "../../application/scheduling.ts";
 import { storageError } from "./errors.ts";
 
 interface ReservationRow {
   id: string; slot_id: string; patient_id: string; state: Reservation["state"];
+  closure_reason: Reservation["closureReason"] | null;
   created_at: Date; expires_at: Date; starts_at: Date; ends_at: Date; evaluated_at: Date;
 }
 
@@ -40,6 +42,42 @@ function transactionOperations(client: PoolClient): SchedulingTransaction {
         WHERE slot_id = $1 AND state IN ('HELD', 'OFFERED', 'CONFIRMED') ORDER BY id FOR UPDATE`, [slotId]);
       const slot = slots.rows[0];
       return { id: slot.id, startsAt: slot.starts_at.getTime(), endsAt: slot.ends_at.getTime(), occupied: occupants.rowCount !== 0 };
+    },
+    async lockOwnReservation(patientId, reservationId) {
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(reservationId)) return null;
+      const scope = await client.query<{ hospital_id: string; test_type_id: string; slot_id: string }>(`
+        SELECT s.hospital_id, s.test_type_id, s.id AS slot_id FROM scheduling.reservations r
+        JOIN scheduling.slots s ON s.id = r.slot_id WHERE r.id = $1 AND r.patient_id = $2`, [reservationId, patientId]);
+      const target = scope.rows[0];
+      if (!target) return null;
+      await client.query(`SELECT hospital_id FROM scheduling.waiting_list_scopes
+        WHERE hospital_id = $1 AND test_type_id = $2 FOR UPDATE`, [target.hospital_id, target.test_type_id]);
+      await client.query("SELECT id FROM scheduling.slots WHERE id = $1 FOR UPDATE", [target.slot_id]);
+      const result = await client.query<ReservationRow>(`SELECT r.*, c.reason AS closure_reason, s.starts_at, s.ends_at
+        FROM scheduling.reservations r JOIN scheduling.slots s ON s.id = r.slot_id
+        LEFT JOIN scheduling.reservation_closures c ON c.reservation_id = r.id
+        WHERE r.id = $1 AND r.patient_id = $2 FOR UPDATE OF r`, [reservationId, patientId]);
+      const row = result.rows[0];
+      return row ? { id: row.id, slotId: row.slot_id, patientId: row.patient_id, state: row.state, closureReason: row.closure_reason ?? undefined,
+        createdAt: row.created_at.getTime(), expiresAt: row.expires_at.getTime(),
+        startsAt: row.starts_at.getTime(), endsAt: row.ends_at.getTime() } : null;
+    },
+    async setReservationState(reservationId, state) {
+      await client.query("UPDATE scheduling.reservations SET state = $2 WHERE id = $1", [reservationId, state]);
+    },
+    async recordSlotRelease(reservation, reason, occurredAt) {
+      const scope = await client.query<{ hospital_id: string; test_type_id: string }>(
+        "SELECT hospital_id, test_type_id FROM scheduling.slots WHERE id = $1", [reservation.slotId]);
+      const eventId = randomUUID();
+      const payload = { hospitalId: scope.rows[0].hospital_id, testTypeId: scope.rows[0].test_type_id,
+        slotId: reservation.slotId, reservationId: reservation.id, reason };
+      await client.query(`INSERT INTO scheduling.events(id, type, version, occurred_at, payload)
+        VALUES ($1, 'SlotReleased', 1, $2, $3)`, [eventId, new Date(occurredAt), payload]);
+      await client.query(`INSERT INTO scheduling.reservation_closures(reservation_id, reason, closed_at, event_id)
+        VALUES ($1, $2, $3, $4)`, [reservation.id, reason, new Date(occurredAt), eventId]);
+      await client.query(`INSERT INTO scheduling.outbox_publications
+        (id, event_id, consumer, cycle, attempt, available_at, created_at)
+        VALUES ($1, $2, 'allocation', 0, 0, $3, $3)`, [randomUUID(), eventId, new Date(occurredAt)]);
     },
     async currentTime() {
       // A separate command is essential: no clock evaluation before a lock wait.
@@ -83,6 +121,15 @@ export function postgresScheduling(pool: Pool): Scheduling {
     },
     async patientExists(patientId) {
       try { return await patientExists(pool, patientId); } catch (error) { throw storageError(error); }
+    },
+    async dueDirectHolds() {
+      try {
+        // Candidates only: every transition locks and revalidates the reservation afresh.
+        const result = await pool.query<{ id: string; patientId: string }>(`SELECT id, patient_id AS "patientId"
+          FROM scheduling.reservations WHERE state = 'HELD' AND expires_at <= date_trunc('milliseconds', clock_timestamp())
+          ORDER BY expires_at, id LIMIT 100`);
+        return result.rows;
+      } catch (error) { throw storageError(error); }
     },
     async readOwnReservation(patientId, reservationId) {
       try {

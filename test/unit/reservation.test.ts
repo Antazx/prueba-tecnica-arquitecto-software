@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decideDirectHold, evaluateReservation } from "../../src/scheduling/domain/reservation.ts";
+import { decideDirectHold, evaluateReservation, decideConfirmation, decideCancellation } from "../../src/scheduling/domain/reservation.ts";
 
 describe("direct hold deadline", () => {
   it("allows at most ten minutes, capped at the slot start", () => {
@@ -34,4 +34,54 @@ describe("own reservation temporal evaluation", () => {
     expect(evaluateReservation({ state: "CONFIRMED", expiresAt: 1000, startsAt: 2000 }, 2000)).toMatchObject({ canCancel: false });
     expect(evaluateReservation({ state: "EXPIRED", expiresAt: 1000, startsAt: 2000 }, 3000)).toMatchObject({ expired: false, closurePending: false, canConfirm: false });
   });
+});
+
+describe("direct reservation confirmation", () => {
+  it("confirms the same hold until one millisecond before its deadline", () => {
+    expect(decideConfirmation({ state: "HELD", expiresAt: 1000, startsAt: 2000 }, 999))
+      .toEqual({ state: "CONFIRMED", allowed: true });
+  });
+});
+
+it("expires late confirmations at equality and one millisecond later", () => {
+  for (const time of [1000, 1001]) expect(decideConfirmation({ state: "HELD", expiresAt: 1000, startsAt: 2000 }, time))
+    .toEqual({ state: "EXPIRED", allowed: false, code: "RESERVATION_EXPIRED" });
+});
+
+it("repeats confirmation by current state and preserves terminal reservations", () => {
+  expect(decideConfirmation({ state: "CONFIRMED", expiresAt: 1000, startsAt: 2000 }, 3000)).toEqual({ state: "CONFIRMED", allowed: true });
+  expect(decideConfirmation({ state: "CANCELLED", expiresAt: 1000, startsAt: 2000 }, 3000)).toEqual({ state: "CANCELLED", allowed: false, code: "RESERVATION_STATE_CONFLICT" });
+  expect(decideConfirmation({ state: "EXPIRED", expiresAt: 1000, startsAt: 2000 }, 3000)).toEqual({ state: "EXPIRED", allowed: false, code: "RESERVATION_EXPIRED" });
+});
+
+describe("direct reservation cancellation", () => {
+  it("cancels a live hold but expires it at equality and one millisecond later", () => {
+    const reservation = { state: "HELD", expiresAt: 1000, startsAt: 2000 } as const;
+    expect(decideCancellation(reservation, 999)).toEqual({ state: "CANCELLED", allowed: true });
+    for (const time of [1000, 1001]) expect(decideCancellation(reservation, time))
+      .toEqual({ state: "EXPIRED", allowed: false, code: "RESERVATION_EXPIRED" });
+  });
+});
+
+it("cancels a confirmed appointment only before start and repeats valid cancellation even later", () => {
+  const confirmed = { state: "CONFIRMED", expiresAt: 1000, startsAt: 2000 } as const;
+  expect(decideCancellation(confirmed, 1999)).toEqual({ state: "CANCELLED", allowed: true });
+  for (const time of [2000, 2001]) expect(decideCancellation(confirmed, time))
+    .toEqual({ state: "CONFIRMED", allowed: false, code: "APPOINTMENT_STARTED" });
+  expect(decideCancellation({ ...confirmed, state: "CANCELLED", closureReason: "CANCELLED" }, 3000)).toEqual({ state: "CANCELLED", allowed: true });
+  expect(decideCancellation({ ...confirmed, state: "EXPIRED" }, 3000)).toEqual({ state: "EXPIRED", allowed: false, code: "RESERVATION_EXPIRED" });
+});
+
+it("requires the offer operations and never treats cancellation as offer rejection", () => {
+  for (const time of [999, 1000, 1001]) expect(decideCancellation({ state: "OFFERED", expiresAt: 1000, startsAt: 2000 }, time))
+    .toEqual({ state: "OFFERED", allowed: false, code: "RESERVATION_STATE_CONFLICT" });
+  expect(decideCancellation({ state: "CANCELLED", closureReason: "OFFER_REJECTED", expiresAt: 1000, startsAt: 2000 }, 3000))
+    .toEqual({ state: "CANCELLED", allowed: false, code: "RESERVATION_STATE_CONFLICT" });
+});
+
+it("can shorten the configured hold TTL without extending the ten-minute policy", () => {
+  expect(decideDirectHold({ startsAt: 2000, occupied: false }, 0, 500)).toEqual({ allowed: true, createdAt: 0, expiresAt: 500 });
+  expect(decideDirectHold({ startsAt: 300, occupied: false }, 0, 500)).toEqual({ allowed: true, createdAt: 0, expiresAt: 300 });
+  expect(() => decideDirectHold({ startsAt: 1000000, occupied: false }, 0, 600001)).toThrow();
+  expect(() => decideDirectHold({ startsAt: 1000000, occupied: false }, 0, 0)).toThrow();
 });
