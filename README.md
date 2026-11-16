@@ -1,8 +1,10 @@
 # Citación de pruebas diagnósticas
 
 Implementación de la [prueba de arquitectura de software](docs/diagnostic-appointment-requirements.pdf).
-Esta entrega permite arrancar una agenda sintética validada y consultarla por HTTP.
-Los bloqueos, las citas y la lista de espera corresponden a las siguientes entregas.
+Esta entrega permite consultar una agenda sintética validada, bloquear un hueco
+con exclusividad y recuperar el resultado de creación mediante idempotencia.
+La confirmación, cancelación, caducidad automática y lista de espera corresponden
+a las siguientes entregas.
 
 ## Diseño funcional acordado
 
@@ -17,8 +19,8 @@ las reglas restantes siguen siendo trabajo pendiente.
 
 1. **Agenda precargada.** La demo usa huecos sintéticos precargados, sin
    operaciones de administración de agendas. El seed se valida para impedir
-   intervalos solapados de un mismo recurso. La exclusividad concurrente que
-   implementará el servicio será por hueco; esa garantía, por sí sola, no impide
+   intervalos solapados de un mismo recurso. La exclusividad concurrente
+   implementada para bloqueos es por hueco; esa garantía, por sí sola, no impide
    solapamientos entre huecos diferentes de una máquina.
 2. **Admisión condicionada, Q2 revisada y Q24.** Primero se recuperará un éxito
    previo de la clave; para una intención nueva se resolverán vencimientos bajo
@@ -103,8 +105,8 @@ El grilling está cerrado para el alcance acordado hasta Q26. Los criterios
 AC59–AC64 cubren el bloqueo propio, otros ámbitos, vencimiento durante la espera,
 replays e inscripción existente y la convivencia permitida. AC65–AC67 cubren
 Q25–Q26; AC68–AC69 hacen visibles límites ya aceptados de Q24 y del aviso.
-La implementación de reservas, lista de espera y mensajería de negocio sigue
-pendiente. Los comandos siguientes incluyen la consulta de agenda ya entregada.
+Están implementados la consulta de agenda, los bloqueos y su consulta propia.
+Las transiciones posteriores, la lista de espera y la mensajería siguen pendientes.
 
 ## Arranque con un comando
 
@@ -154,9 +156,73 @@ requiere `X-Patient-Id`. PostgreSQL obtiene el tiempo truncado a milisegundos y 
 huecos en una sola sentencia, con una fotografía coherente y sin escrituras.
 Es información orientativa: una reserva posterior deberá revalidarla.
 
-En esta primera entrega todos los huecos futuros son directamente reservables:
-todavía no existen reservas ni inscripciones. Los siguientes tickets incorporarán
-la ocupación persistida y la prioridad elegible a esa misma consulta.
+`directlyBookable` es falso si existe una reserva persistida en `HELD`, `OFFERED`
+o `CONFIRMED`, aunque haya vencido su plazo temporal. GET no materializa cierres.
+La prioridad elegible se añadirá cuando exista la inscripción en lista de espera.
+
+## Crear y consultar un bloqueo
+
+La identidad de demostración se presenta mediante `X-Patient-Id`, con uno de los
+tres pacientes sintéticos del seed. Esta cabecera puede falsificarse: demuestra
+titularidad bajo la identidad presentada, no autenticación ni protección frente
+a suplantación. No usar este modo con pacientes reales.
+
+```bash
+curl --fail -X POST http://127.0.0.1:3000/slots/slot-north-mri-1/holds \
+  -H 'X-Patient-Id: patient-ana' \
+  -H 'Idempotency-Key: ana-first-hold'
+```
+
+El POST no admite cuerpo: propietario, instante de creación y plazo los determina
+el servidor. Devuelve `201` con `id`, `slotId`, estado `HELD`, `createdAt`,
+`expiresAt`, `startsAt` y `endsAt`. El vencimiento es el menor entre creación más
+diez minutos e inicio del hueco; desde la igualdad con el inicio no crea reserva.
+El mismo paciente puede bloquear más de un hueco; no se añade una unicidad por
+paciente ni se aplica aquí la futura regla de admisión Q24.
+
+Guarda la clave antes del primer intento y conserva la misma para sus reintentos.
+Misma clave, paciente, operación y destino recuperan el cuerpo y el `201`
+originales, aunque la reserva haya cambiado después, sin ampliar plazo. Reutilizar
+una clave exitosa para otro hueco da `409 IDEMPOTENCY_KEY_REUSED`; pacientes
+distintos mantienen registros independientes. Un conflicto sin éxito previo se
+reevalúa al reintentar y un rollback no conserva creación o éxito parciales.
+
+Con el identificador devuelto:
+
+```bash
+curl --fail http://127.0.0.1:3000/reservations/ID_DEVUELTO \
+  -H 'X-Patient-Id: patient-ana'
+```
+
+GET añade `evaluatedAt`, `temporal.expired`, `temporal.closurePending` y `actions`
+(`canConfirm`, `canCancel`, `canRejectOffer`). El estado es siempre el persistido.
+Si un temporal ha vencido, informa cierre pendiente y deshabilita las acciones,
+sin modificar filas. Una confirmada no vence por su antiguo plazo. Las acciones
+describen permisos funcionales de Q26; sus endpoints de transición se incorporan
+en las siguientes entregas. Cada POST futuro volverá a validar estado y tiempo.
+
+Cabecera ausente o inválida, paciente inexistente, clave ausente o cuerpo dan
+`400`; recurso inexistente o ajeno da el mismo `404 NOT_FOUND`. El POST responde
+`409 SLOT_OCCUPIED` si ya existe un ocupante, y `409 SLOT_STARTED` si se alcanzó
+el inicio. Los fallos transitorios identificables de PostgreSQL dan
+`503 DEPENDENCY_UNAVAILABLE` también en GET; otros errores internos conservan
+`500 INTERNAL_ERROR`. Puede reintentarse una creación incierta con su misma clave.
+
+La transacción usa `READ COMMITTED`: coordina primero el registro único
+paciente/operación/clave y recupera su resultado después de esperar; a continuación
+bloquea la fila estable del ámbito, el hueco y sus reservas ordenadas por ID.
+Hace lecturas nuevas tras adquirir la coordinación y pide
+`date_trunc('milliseconds', clock_timestamp())` en otro comando después de leer
+el estado protegido. Reserva y resultado se guardan con el mismo cliente antes
+del commit. No mantiene bloqueos mientras responde HTTP o espera al paciente.
+Un índice único parcial sobre estados ocupantes protege además la exclusividad,
+incluidas filas vencidas aún sin cerrar. Ámbitos distintos avanzan de forma
+independiente; el mismo ámbito serializa sus escrituras breves. La espera de
+bloqueos se limita a dos segundos y las sentencias a 2,5 segundos.
+
+El barrido y las liberaciones durables aún no están implementados. Un bloqueo
+vencido seguirá ocupando hasta incorporar esa transición; no se promete todavía
+el recorrido completo del enunciado ni la prioridad de lista del ticket siguiente.
 
 ## Disponibilidad y recuperación
 
@@ -233,9 +299,18 @@ TEST_DATABASE_URL=postgresql://diagnostic:diagnostic_dev@127.0.0.1:55434/diagnos
 ```
 
 `pnpm test` ejecuta las reglas puras; `pnpm test:integration` comprueba el contrato
-HTTP con Fastify `inject` y PostgreSQL real. La lectura usa una conexión PostgreSQL
-de solo lectura. También comprueba reinicialización, rechazo de solapamientos y
-restricciones de intervalo y coherencia de recursos. `pnpm typecheck` comprueba
+HTTP con Fastify `inject` y PostgreSQL real. Las consultas se comprueban también
+con una conexión de solo lectura. La concurrencia arranca dos procesos Node con
+pools propios y usa una conexión controladora que retiene el ámbito; un observador
+verifica esperas reales y sus cadenas con `pg_stat_activity`/`pg_blocking_pids`
+antes de soltarlo. Cubre tres pacientes competidores, ámbitos independientes,
+misma clave entre instancias, respuesta no leída y cruce del inicio durante la
+espera. Un fallo SQL por permisos en la escritura final del resultado acredita
+rollback de reserva y clave, y permite reintentar. El usuario SQL de esta base
+aislada debe poder crear y eliminar el rol temporal de esa prueba.
+También comprueba reinicialización, rechazo de solapamientos, restricciones,
+titularidad sintética, plazos, replay, lectura conservadora, unicidad con ocupante
+vencido y clasificación de fallos. `pnpm typecheck` comprueba
 aplicación, pruebas y configuración con TypeScript estricto; `pnpm build` genera
 la aplicación. CI ejecuta esos mismos comandos con PostgreSQL real. No hay lint ni
 formato automáticos configurados, ni se atribuye a `inject` cobertura de red E2E.
@@ -262,8 +337,9 @@ correspondiente del modo local. Los servicios de Compose conservan sus puertos
 internos. La API de Compose escucha internamente en 3000.
 
 PostgreSQL conserva su volumen entre arranques. `db/schema.sql` define hospitales,
-tipos, recursos, pacientes sintéticos, ámbitos y huecos, con claves que impiden
-mezclar ámbitos y restricciones que exigen intervalos no vacíos y milisegundos.
+tipos, recursos, pacientes sintéticos, ámbitos, huecos, reservas y resultados de
+creación, con claves que impiden mezclar ámbitos y restricciones que exigen
+intervalos no vacíos, milisegundos y un ocupante por hueco.
 La API ejecuta esquema y seed en una transacción de inicialización coordinada,
 valida automáticamente la agenda completa y solo después empieza a escuchar.
 Una agenda solapada de un mismo recurso impide arrancar la API. El worker exige
@@ -304,7 +380,7 @@ docker compose down
 | TypeScript | 6.0.3 | Versión estable mantenida y compatible con la preparación de calidad prevista |
 | pnpm | 12.21.0 | Versión y lockfile fijados |
 | Fastify | 5.12.8 | HTTP directo con composición explícita y política LTS |
-| PostgreSQL | 18.7 | Versión estable soportada; transacciones y restricciones para la futura citación |
+| PostgreSQL | 18.7 | Transacciones y restricciones para exclusividad e idempotencia |
 | `pg` | 8.23.1 | SQL y cliente transaccional explícitos, sin ORM |
 | RabbitMQ | 4.4.0 | Broker independiente de la base de datos, con soporte comunitario vigente |
 | `amqplib` | 2.3.1 | Control directo de conexiones, confirmaciones y acuses AMQP |
@@ -325,20 +401,25 @@ src/
 ├── bootstrap/                     Composición y ciclo de vida de cada proceso
 ├── config/                        Lectura de configuración por proceso
 └── scheduling/
+    ├── domain/                    Reglas puras de agenda, plazos y evaluación
+    ├── application/               Casos de uso y puerto transaccional de citación
     └── adapters/
-        ├── http/                  API, agenda y comprobaciones de disponibilidad
-        ├── postgres/              Pool, inicialización validada y lectura de agenda
+        ├── http/                  Contrato HTTP e identidad sintética
+        ├── postgres/              Coordinación, persistencia y reloj autoritativo
         └── rabbitmq/              Conexión AMQP
 ```
 
-`scheduling/domain/` contiene la validación pura de agenda e instantes;
-`scheduling/application/` define el contrato de lectura. No se imponen repositorios
-CRUD genéricos ni se adelantan transacciones de funcionalidades aún pendientes.
+Las reglas no importan HTTP, SQL ni AMQP. Los casos de uso acceden a un único
+puerto de citación con un callback transaccional y operaciones concretas; el
+cliente `pg` permanece dentro del adaptador. Se evita un mutex en memoria, que
+no coordinaría instancias, y repositorios CRUD genéricos, que ocultarían la
+atomicidad necesaria. Los bloqueos pesimistas del ámbito simplifican este
+ejercicio frente a detectar conflictos de varias escrituras al final.
 
 ## Alcance pendiente
 
-- Funcionalidades del PDF: bloqueos con caducidad, confirmaciones,
-  cancelaciones, exclusividad bajo concurrencia y lista de espera con ofertas.
+- Caducidad automática y materialización de cierres, confirmaciones,
+  cancelaciones y lista de espera con prioridad, ofertas y avisos asíncronos.
 - Transactional Outbox e Idempotent Consumer, acordados para la entrega funcional.
 - Ampliar las suites y CI al entregar las siguientes funcionalidades. Herramientas
   adicionales de lint/formato siguen siendo propuestas.

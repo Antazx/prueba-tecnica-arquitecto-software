@@ -1,9 +1,49 @@
 import Fastify from "fastify";
 import type { AgendaReader } from "../../application/agenda.ts";
 import { parseExternalInstant } from "../../domain/instant.ts";
+import type { SchedulingUseCases } from "../../application/reservations.ts";
+import { DependencyUnavailable } from "../../application/scheduling.ts";
 
-export function buildApi(checkPostgres: () => Promise<void>, readAgenda: AgendaReader) {
+export function buildApi(checkPostgres: () => Promise<void>, readAgenda: AgendaReader, scheduling?: SchedulingUseCases) {
   const api = Fastify({ logger: true, ajv: { customOptions: { removeAdditional: false, coerceTypes: false } } });
+
+  api.setErrorHandler((error, request, reply) => {
+    if (error instanceof DependencyUnavailable) {
+      request.log.warn({ err: error }, "Scheduling storage unavailable");
+      return reply.code(503).send({ code: "DEPENDENCY_UNAVAILABLE" });
+    }
+    if (error instanceof Error && "validation" in error) return reply.code(400).send({ code: "INVALID_REQUEST" });
+    if (error instanceof Error && "statusCode" in error && typeof error.statusCode === "number" &&
+        error.statusCode >= 400 && error.statusCode < 500) {
+      return reply.code(400).send({ code: "INVALID_REQUEST" });
+    }
+    request.log.error({ err: error }, "Request failed");
+    return reply.code(500).send({ code: "INTERNAL_ERROR" });
+  });
+
+  if (scheduling) {
+    const id = { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$" };
+    const patientHeaders = { type: "object", required: ["x-patient-id"], properties: { "x-patient-id": id } };
+    const params = { type: "object", required: ["id"], properties: { id }, additionalProperties: false };
+    api.post<{ Params: { id: string }; Headers: { "x-patient-id": string; "idempotency-key": string } }>("/slots/:id/holds", {
+      schema: { params, headers: {
+        ...patientHeaders,
+        required: ["x-patient-id", "idempotency-key"],
+        properties: { ...patientHeaders.properties, "idempotency-key": { type: "string", minLength: 1, maxLength: 200, pattern: "^[!-~]+$" } },
+      } },
+    }, async (request, reply) => {
+      // Ownership and deadline come exclusively from the presented identity and the server.
+      if (request.body !== undefined) return reply.code(400).send({ code: "BODY_NOT_ALLOWED" });
+      const result = await scheduling.createHold(request.headers["x-patient-id"], request.params.id, request.headers["idempotency-key"]);
+      return reply.code(result.status).send(result.body);
+    });
+    api.get<{ Params: { id: string }; Headers: { "x-patient-id": string } }>("/reservations/:id", {
+      schema: { params, headers: patientHeaders },
+    }, async (request, reply) => {
+      const result = await scheduling.getReservation(request.headers["x-patient-id"], request.params.id);
+      return reply.code(result.status).send(result.body);
+    });
+  }
 
   api.get<{ Querystring: { hospitalId: string; testTypeId: string; from: string; to: string } }>("/slots", {
     schema: {
