@@ -37,14 +37,14 @@ describe("own reservation temporal evaluation", () => {
 });
 
 describe("direct reservation confirmation", () => {
-  it("confirms the same hold until one millisecond before its deadline", () => {
-    expect(decideConfirmation({ state: "HELD", expiresAt: 1000, startsAt: 2000 }, 999))
+  it.each(["HELD", "OFFERED"] as const)("confirms the same %s until one millisecond before its deadline", (state) => {
+    expect(decideConfirmation({ state, expiresAt: 1000, startsAt: 2000 }, 999))
       .toEqual({ state: "CONFIRMED", allowed: true });
   });
 });
 
-it("expires late confirmations at equality and one millisecond later", () => {
-  for (const time of [1000, 1001]) expect(decideConfirmation({ state: "HELD", expiresAt: 1000, startsAt: 2000 }, time))
+it.each(["HELD", "OFFERED"] as const)("expires late %s confirmations at equality and one millisecond later", (state) => {
+  for (const time of [1000, 1001]) expect(decideConfirmation({ state, expiresAt: 1000, startsAt: 2000 }, time))
     .toEqual({ state: "EXPIRED", allowed: false, code: "RESERVATION_EXPIRED" });
 });
 

@@ -146,3 +146,25 @@ it("serializes confirmation then cancellation through two processes without dupl
   expect(await cancelling).toMatchObject({ status: 200, body: { id: reservation.id, state: "CANCELLED" } });
   expect((await pool.query("SELECT count(*)::integer AS count FROM scheduling.events WHERE payload->>'reservationId'=$1", [reservation.id])).rows[0].count).toBe(1);
 });
+
+it("rejects a new confirmed cancellation after two API requests wait across the slot start", async () => {
+  const reservation = await hold("cross-start");
+  expect((await transition(pair.a, reservation.id, "confirm")).status).toBe(200);
+  await pool.query("UPDATE scheduling.reservations SET created_at=created_at-interval '20 minutes', expires_at=expires_at-interval '20 minutes' WHERE id=$1", [reservation.id]);
+  const start = (await pool.query<{ starts_at: Date }>(`UPDATE scheduling.slots
+    SET starts_at=date_trunc('milliseconds',clock_timestamp())+interval '900 milliseconds',
+        ends_at=date_trunc('milliseconds',clock_timestamp())+interval '30 minutes'
+    WHERE id=$1 RETURNING starts_at`, [reservation.slotId])).rows[0].starts_at;
+  const barrier = await holdScope(pool, "hospital-north", "mri");
+  const a = transition(pair.a, reservation.id, "cancel");
+  const b = transition(pair.b, reservation.id, "cancel");
+  try {
+    for (const request of await awaitBlocked(pool, [pair.a.applicationName, pair.b.applicationName], barrier.pid)) {
+      expect(request.query_start.getTime()).toBeLessThan(start.getTime());
+    }
+    await eventually(async () => (await pool.query("SELECT clock_timestamp()>=$1 AS reached", [start])).rows[0].reached, Boolean);
+  } finally { await barrier.release(); }
+  for (const result of await Promise.all([a, b])) expect(result).toMatchObject({ status: 409,
+    body: { id: reservation.id, state: "CONFIRMED", code: "APPOINTMENT_STARTED" } });
+  expect((await pool.query("SELECT * FROM scheduling.reservation_closures WHERE reservation_id=$1", [reservation.id])).rows).toEqual([]);
+});
