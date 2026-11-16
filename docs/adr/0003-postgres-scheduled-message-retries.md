@@ -1,0 +1,7 @@
+# Conservar en PostgreSQL el presupuesto y la programación de reintentos
+
+El presupuesto aceptado mide intentos lógicos de procesamiento, no entregas físicas de AMQP, y exige conservar trabajo al programar reintentos o aparcar un fallo. Se guardarán en PostgreSQL el presupuesto, la próxima ejecución y el trabajo de outbox correspondiente antes de reconocer el mensaje original, reutilizando la recuperación durable del outbox. Frente a programar las esperas mediante colas TTL y dead-lettering, esta elección concentra el control de intentos y la protección frente a duplicados en la misma persistencia del consumidor, a cambio de mantener estado de reintentos y publicación programada; RabbitMQ seguirá transportando los mensajes y la DLQ.
+
+La corrección de Q17 conserva además un límite físico finito en RabbitMQ y su traslado a DLQ con estrategia `at-least-once`, `overflow=reject-publish` y DLX configurado. Esa protección del transporte puede aparcar un mensaje antes de agotar el presupuesto lógico y no lo marca como completado; la recuperación distinguirá ambos motivos.
+
+El [diseño consolidado](../functional-design.md) distingue ese presupuesto de los envíos del relay único configurado. Una publicación fallida conserva su próxima fecha durable y permite avanzar a otras publicaciones listas para enviar, sin consumir intentos del consumidor; toda la evidencia se retiene durante la vida de la demo.
