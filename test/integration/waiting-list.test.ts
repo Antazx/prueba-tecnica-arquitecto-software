@@ -6,6 +6,7 @@ import { initializeDatabase } from "../../src/scheduling/adapters/postgres/initi
 import { listSlots } from "../../src/scheduling/adapters/postgres/slots.ts";
 import { postgresScheduling } from "../../src/scheduling/adapters/postgres/scheduling.ts";
 import { schedulingUseCases } from "../../src/scheduling/application/reservations.ts";
+import { readApiContract, expectContractResponse } from "../helpers/openapi.ts";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (!databaseUrl) throw new Error("TEST_DATABASE_URL is required; use an isolated test database");
@@ -152,6 +153,7 @@ it("keeps eligible waiting priority on free slots in GET and direct hold while t
   const conflict = await direct();
   expect(conflict.statusCode).toBe(409);
   expect(conflict.json().code).toBe("WAITING_LIST_PRIORITY");
+  expectContractResponse(await readApiContract(api), "POST", "/slots/{id}/holds", conflict);
   const bruno = await join("wait-test-priority-bruno", "patient-bruno");
   expect(bruno.statusCode).toBe(201);
   expect(bruno.json().admissionOrder).toBe("2");
