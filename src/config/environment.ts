@@ -37,5 +37,7 @@ export function readWorkerConfig(environment = process.env) {
     expirySweepIntervalMs: duration(environment, "EXPIRY_SWEEP_INTERVAL_MS", 3000),
     offerMaximumMs: duration(environment, "OFFER_MAXIMUM_MS", 7_200_000),
     relayEnabled: environment.RELAY_ENABLED === "true",
+    outboxRetryDelayMs: duration(environment, "OUTBOX_RETRY_DELAY_MS", 5000),
+    publisherConfirmTimeoutMs: duration(environment, "PUBLISHER_CONFIRM_TIMEOUT_MS", 5000),
   };
 }

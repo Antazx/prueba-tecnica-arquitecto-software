@@ -131,9 +131,13 @@ CREATE TABLE IF NOT EXISTS scheduling.outbox_publications (
     attempt integer NOT NULL CHECK (attempt BETWEEN 0 AND 3),
     available_at timestamptz NOT NULL,
     created_at timestamptz NOT NULL,
+    send_count integer NOT NULL DEFAULT 0 CHECK (send_count >= 0),
+    last_attempt_at timestamptz,
+    last_error text,
+    next_attempt_at timestamptz,
     published_at timestamptz
 );
-CREATE INDEX IF NOT EXISTS outbox_ready_idx ON scheduling.outbox_publications(available_at, created_at, id)
+CREATE INDEX IF NOT EXISTS outbox_ready_idx ON scheduling.outbox_publications(GREATEST(available_at, next_attempt_at), created_at, id)
     WHERE published_at IS NULL;
 CREATE INDEX IF NOT EXISTS outbox_event_idx ON scheduling.outbox_publications(event_id);
 

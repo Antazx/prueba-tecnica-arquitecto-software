@@ -351,6 +351,7 @@ it("retains a publication when its relay dies after broker confirmation and repu
     const child = spawn(process.execPath, ["test/helpers/relay-process.ts"], { cwd: process.cwd(), env: {
       ...process.env, DATABASE_URL: databaseUrl, RABBITMQ_URL: process.env.TEST_RABBITMQ_URL,
       PUBLICATION_ID: envelope.publicationId, PAUSE_AFTER_CONFIRM: String(pause),
+      OUTBOX_RETRY_DELAY_MS: "100",
     }, stdio: ["ignore", "pipe", "pipe", "ipc"] });
     child.on("message", (message: { phase: string; delivery?: Delivery }) => phases.push(message));
     child.stderr?.on("data", (chunk: Buffer) => { logs += chunk.toString(); });
@@ -363,13 +364,17 @@ it("retains a publication when its relay dies after broker confirmation and repu
   const a = await relay(true);
   try {
     const exited = once(a.child, "exit"); a.child.kill("SIGKILL"); await exited;
-    expect((await postgresOutbox(pool).ready()).find((work) => work.publicationId === envelope.publicationId)).toEqual(envelope);
+    expect((await pool.query("SELECT send_count,published_at FROM scheduling.outbox_publications WHERE id=$1", [envelope.publicationId])).rows[0])
+      .toEqual({ send_count: 1, published_at: null });
+    const readyAgain = await eventually(() => postgresOutbox(pool).ready(), (work) => work.some((item) => item.publicationId === envelope.publicationId), 2000);
+    expect(readyAgain.find((work) => work.publicationId === envelope.publicationId)).toEqual(envelope);
     const b = await relay(false);
     if (b.child.exitCode === null) await once(b.child, "exit");
     expect(b.child.exitCode).toBe(0);
     expect(a.phases[0].delivery).toEqual(b.phases[0].delivery);
     await eventually(async () => consumer.phases.filter((phase) => phase === "committed").length, (count) => count === 2, 8000);
     expect((await postgresOutbox(pool).ready()).some((work) => work.publicationId === envelope.publicationId)).toBe(false);
+    expect((await pool.query("SELECT send_count FROM scheduling.outbox_publications WHERE id=$1", [envelope.publicationId])).rows[0].send_count).toBe(2);
     expect((await pool.query("SELECT count(*)::integer AS n FROM scheduling.reservations WHERE slot_id='offer-test-h' AND state='OFFERED'")).rows[0].n).toBe(1);
   } finally {
     if (a.child.exitCode === null && a.child.signalCode === null) { const exited = once(a.child, "exit"); a.child.kill("SIGKILL"); await exited; }

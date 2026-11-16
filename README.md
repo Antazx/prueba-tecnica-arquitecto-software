@@ -74,9 +74,9 @@ coordinación, tiempo, FIFO, mensajería, alternativas, pruebas previstas y
 trazabilidad hasta Q26. La [referencia técnica](docs/technical-design.md) remite
 a ese documento y recoge cómo reanudar `to-spec` tras limpiar el contexto.
 
-Habrá un único relay habilitado por configuración y consumidores replicables,
+Hay un único relay habilitado por configuración y consumidores replicables,
 sin elección de líder, bloqueo asesor ni relevo automático en la demo. El relay
-publicará secuencialmente y conservará una próxima fecha durable tras un fallo,
+publica secuencialmente y conserva una próxima fecha durable tras un fallo,
 permitiendo avanzar a otras publicaciones listas cuya ruta funcione.
 
 Un rechazo válido guardará un único `SlotReleased`, que ya activa la revisión
@@ -469,6 +469,8 @@ conexiones internas mediante los nombres `postgres` y `rabbitmq`.
 | `WORKER_HEALTH_PORT` | Comprobaciones del worker local; 3001 por defecto |
 | `DIRECT_HOLD_TTL_MS` | TTL de bloqueo de la API; 600000 por defecto, entre 1 y 600000 ms |
 | `EXPIRY_SWEEP_INTERVAL_MS` | Intervalo positivo de barrido del worker; 3000 ms por defecto |
+| `OUTBOX_RETRY_DELAY_MS` | Espera positiva de transporte por publicación fallida o incierta; 5000 ms por defecto |
+| `PUBLISHER_CONFIRM_TIMEOUT_MS` | Plazo positivo para resolver confirmación, devolución y contrapresión; 5000 ms por defecto |
 | `POSTGRES_PORT`, `RABBITMQ_PORT` | Puertos publicados por Compose; 5432 y 5672 por defecto |
 
 Si cambias un puerto publicado de PostgreSQL o RabbitMQ, ajusta también la URL
@@ -565,6 +567,26 @@ haya confirm positivo; el booleano de `publish` solo regula contrapresión.
 `published_at` acredita publicación confirmada con ruta, no consumo ni aviso.
 Una caída tras aceptación del broker y antes de guardar esa fecha puede duplicar.
 
+Cada envío registra antes de tocar la red `send_count`, `last_attempt_at` y una
+fecha conservadora `next_attempt_at`; una caída incierta también conserva esa
+espera. Un fallo guarda `last_error` y programa desde su detección una espera
+positiva `OUTBOX_RETRY_DELAY_MS`. La fecha lógica `available_at` no cambia. Solo
+se eligen pendientes cuyo máximo de fechas lógica y de transporte haya llegado,
+respetando además `consumer_attempts.not_before` cuando ya existe; el orden total
+es fecha efectiva, creación e ID. No se purgan pendientes tras un número de envíos
+ni se gastan con ellos los intentos del consumidor. La evidencia publicada y el
+último error se retienen, y una publicación ya completada no vuelve a seleccionarse.
+
+Una devolución sin ruta resuelta con confirmación conserva el canal y permite
+enviar otra publicación lista antes de reparar el binding. Un timeout, nack,
+error o cierre deja resultado incierto, retira esa generación de conexión y
+reconstruye canales y topología. La espera máxima de confirmación y contrapresión
+es `PUBLISHER_CONFIRM_TIMEOUT_MS`; el cierre espera como máximo 500 ms antes de
+abortar su socket. Las respuestas antiguas pertenecen a canales retirados. Si
+falla toda la conexión, se espera un segundo entre conexiones, además del tiempo
+de conexión; solo se exige avance independiente con broker y otra ruta operativos.
+Esto no ofrece un plazo máximo de entrega.
+
 Cada entrega lleva versión, evento, consumidor lógico, ciclo, intento y publicación
 separados. El consumidor coordina la pareja evento/consumidor en PostgreSQL antes
 del ámbito. Guarda efectos, resultado por ciclo/intento y siguientes eventos en
@@ -622,13 +644,19 @@ de escritura. Para el recorrido manual puede reducirse `DIRECT_HOLD_TTL_MS` en
 Compose y seguir `docker compose logs --follow worker` para obtener la oferta;
 los GET propios y el endpoint de confirmación completan la aceptación.
 
+`relay-recovery.test.ts` prueba con PostgreSQL y RabbitMQ reales que P2 se publica
+mientras P1 sigue sin binding, que P1 conserva fecha e identidades tras reiniciar
+el relay y que W2 no toma su papel. Un proxy TCP de prueba retiene respuestas
+reales para forzar timeout y comprobar la retirada de la conexión antigua; no
+fabrica callbacks de confirmación. También cubre selección temporal, desempate y
+más de cuatro fallos de transporte sin consumir intentos lógicos. La prueba de
+caída tras confirmación usa el mismo paso de relay que el worker y comprueba
+republicación física con un solo efecto SQL.
+
 ## Alcance pendiente
 
 - Rechazo de ofertas y retirada con oferta (#9); barrido de ofertas y normalización
   completa de nuevas altas/reinscripciones (#10).
-- Recuperación del relay con fechas/errores durables y progreso entre rutas rotas
-  (#11). En esta entrega un fallo deja pendiente y reconecta, pero puede retrasar
-  otras publicaciones; no se atribuye ya AC35 completo.
 - Presupuesto lógico, backoff SQL, aparcado de fallos y recuperación manual
   (#12–#13). Hasta entonces un fallo revierte negocio y conserva la entrega,
   espera un segundo antes de rechazar/reencolar cada fallo y usa la protección
