@@ -1,6 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import type { Channel, ChannelModel, ConfirmChannel, Message } from "amqplib";
 import type { Delivery } from "../../application/messages.ts";
+import type { PublicationResult } from "../../application/outbox.ts";
 
 export const queues = { allocation: "appointments.allocation", notification: "appointments.notifications" } as const;
 
@@ -18,12 +19,15 @@ export async function assertTopology(channel: Channel) {
 }
 
 // The relay awaits each invocation: returns and confirms concern exactly one publication.
-export function publishConfirmed(channel: ConfirmChannel, exchange: string, routingKey: string, delivery: Delivery): Promise<void> {
+export class UnroutablePublicationError extends Error {}
+
+export function publishConfirmed(channel: ConfirmChannel, exchange: string, routingKey: string, delivery: Delivery, timeoutMs = 5000): Promise<void> {
   return new Promise((resolve, reject) => {
     let returned = false;
     let confirmed = false;
     let drained = true;
     let settled = false;
+    let confirmationError: Error | undefined;
     const finish = (error?: Error) => {
       if (settled || (!error && (!confirmed || !drained))) return;
       settled = true;
@@ -34,22 +38,35 @@ export function publishConfirmed(channel: ConfirmChannel, exchange: string, rout
     const onReturn = (message: Message) => { if (message.properties.messageId === delivery.publicationId) returned = true; };
     const onClose = () => finish(new Error("Publisher channel closed before confirmation"));
     const onError = (error: Error) => finish(error);
-    const onDrain = () => { drained = true; finish(); };
+    const complete = () => { if (confirmed && drained) finish(confirmationError); };
+    const onDrain = () => { drained = true; complete(); };
     const timer = setTimeout(() => {
       finish(new Error("Publisher confirmation timed out"));
       // Isolate late responses from the next generation; pending SQL remains untouched.
       void channel.close().catch(() => {});
-    }, 5000);
+    }, timeoutMs);
     channel.on("return", onReturn); channel.once("close", onClose); channel.once("error", onError); channel.once("drain", onDrain);
     try {
       drained = channel.publish(exchange, routingKey, Buffer.from(JSON.stringify(delivery)), {
         persistent: true, mandatory: true, contentType: "application/json", type: "appointment-work.v1", messageId: delivery.publicationId,
       }, (error: Error | null) => {
+        if (error) { finish(error); return; }
         confirmed = true;
-        finish(error ?? (returned ? new Error("Publication was unroutable") : undefined));
+        confirmationError = returned ? new UnroutablePublicationError("Publication was unroutable") : undefined;
+        complete();
       });
     } catch (error) { finish(error instanceof Error ? error : new Error("Publication failed")); }
   });
+}
+
+export async function publishDelivery(channel: ConfirmChannel, delivery: Delivery, timeoutMs = 5000): Promise<PublicationResult> {
+  try {
+    await publishConfirmed(channel, "appointments.work", delivery.consumer, delivery, timeoutMs);
+    return { accepted: true };
+  } catch (error) {
+    if (error instanceof UnroutablePublicationError) return { accepted: false, error: error.message };
+    throw error;
+  }
 }
 
 export function parseDelivery(content: Buffer): Delivery {

@@ -6,8 +6,9 @@ import { checkDatabase, createDatabasePool } from "../scheduling/adapters/postgr
 import { initializeDatabase } from "../scheduling/adapters/postgres/initialize.ts";
 import { postgresScheduling } from "../scheduling/adapters/postgres/scheduling.ts";
 import { schedulingUseCases } from "../scheduling/application/reservations.ts";
-import { connectToRabbitMq } from "../scheduling/adapters/rabbitmq/connection.ts";
-import { assertTopology, consumeWork, publishConfirmed } from "../scheduling/adapters/rabbitmq/messaging.ts";
+import { closeRabbitMq, connectToRabbitMq } from "../scheduling/adapters/rabbitmq/connection.ts";
+import { assertTopology, consumeWork, publishDelivery } from "../scheduling/adapters/rabbitmq/messaging.ts";
+import { relayReadyPublications } from "../scheduling/application/outbox.ts";
 import { messageUseCases } from "../scheduling/application/messages.ts";
 import { postgresOutbox } from "../scheduling/adapters/postgres/outbox.ts";
 import { structuredNotificationWriter } from "../scheduling/adapters/notification.ts";
@@ -22,6 +23,7 @@ async function main() {
   let publisher: ConfirmChannel | undefined;
   let initialized = false;
   let nextSweep = 0;
+  let nextConnection = 0;
   const store = postgresScheduling(pool);
   const scheduling = schedulingUseCases(store);
   const messages = messageUseCases(store, structuredNotificationWriter(), { offerMaximumMs: config.offerMaximumMs });
@@ -58,13 +60,15 @@ async function main() {
         console.warn(JSON.stringify({ event: "expiry_sweep_failed", message: error instanceof Error ? error.message : "Unknown error" }));
       }
 
-      if (!connection) {
+      if (!connection && Date.now() >= nextConnection) {
         try {
           const opened = await connectToRabbitMq(config.rabbitmqUrl);
           connection = opened;
-          opened.on("error", () => { state.rabbitmq = false; });
+          opened.on("error", () => { if (connection === opened) state.rabbitmq = false; });
           opened.once("close", () => {
-            if (connection === opened) { connection = undefined; publisher = undefined; }
+            if (connection !== opened) return;
+            connection = undefined; publisher = undefined;
+            nextConnection = Date.now() + 1000;
             state.rabbitmq = false;
             if (!controller.signal.aborted) {
               console.warn(JSON.stringify({ event: "rabbitmq_disconnected", service: "diagnostic-appointments-worker" }));
@@ -75,34 +79,34 @@ async function main() {
           await topology.close();
           if (config.relayEnabled) {
             publisher = await opened.createConfirmChannel();
-            publisher.on("error", () => { state.rabbitmq = false; });
-            publisher.once("close", () => { void opened.close().catch(() => {}); });
+            publisher.on("error", () => { if (connection === opened) state.rabbitmq = false; });
+            publisher.once("close", () => { void closeRabbitMq(opened); });
           }
           for (const consumer of ["allocation", "notification"] as const) {
             const channel = await consumeWork(opened, consumer, consumer === "allocation" ? messages.allocate : messages.notify);
-            channel.once("close", () => { void opened.close().catch(() => {}); });
+            channel.once("close", () => { void closeRabbitMq(opened); });
           }
           state.rabbitmq = true;
         } catch {
           state.rabbitmq = false;
-          await connection?.close().catch(() => {});
+          await closeRabbitMq(connection);
           connection = undefined;
           publisher = undefined;
+          nextConnection = Date.now() + 1000;
         }
       }
 
       if (publisher && state.postgres && state.rabbitmq) {
         try {
-          for (const delivery of await outbox.ready()) {
-            await publishConfirmed(publisher, "appointments.work", delivery.consumer, delivery);
-            await outbox.published(delivery.publicationId);
-          }
+          const activePublisher = publisher;
+          await relayReadyPublications(outbox, (delivery) => publishDelivery(activePublisher, delivery, config.publisherConfirmTimeoutMs), config.outboxRetryDelayMs);
         } catch (error) {
           console.warn(JSON.stringify({ event: "outbox_publication_failed", message: error instanceof Error ? error.message : "Unknown error" }));
-          await connection?.close().catch(() => {});
+          await closeRabbitMq(connection);
           connection = undefined;
           publisher = undefined;
           state.rabbitmq = false;
+          nextConnection = Date.now() + 1000;
         }
       }
 
@@ -117,7 +121,7 @@ async function main() {
   } finally {
     state.postgres = false;
     state.rabbitmq = false;
-    await connection?.close().catch(() => {});
+    await closeRabbitMq(connection);
     await pool.end();
     await new Promise<void>((resolve) => healthServer.close(() => resolve()));
   }
