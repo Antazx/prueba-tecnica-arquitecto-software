@@ -1,13 +1,14 @@
 export type HoldDecision =
   | { allowed: true; createdAt: number; expiresAt: number }
-  | { allowed: false; code: "SLOT_STARTED" | "SLOT_OCCUPIED" };
+  | { allowed: false; code: "SLOT_STARTED" | "SLOT_OCCUPIED" | "WAITING_LIST_PRIORITY" };
 
-export function decideDirectHold(slot: { startsAt: number; occupied: boolean }, evaluatedAt: number, holdTtlMs = 600_000): HoldDecision {
+export function decideDirectHold(slot: { startsAt: number; occupied: boolean; waitingPriority?: boolean }, evaluatedAt: number, holdTtlMs = 600_000): HoldDecision {
   if (!Number.isInteger(holdTtlMs) || holdTtlMs < 1 || holdTtlMs > 600_000) throw new Error("Hold TTL must be an integer between 1 and 600000 milliseconds");
   const createdAt = Math.floor(evaluatedAt);
   const startsAt = Math.floor(slot.startsAt);
   if (createdAt >= startsAt) return { allowed: false, code: "SLOT_STARTED" };
   if (slot.occupied) return { allowed: false, code: "SLOT_OCCUPIED" };
+  if (slot.waitingPriority) return { allowed: false, code: "WAITING_LIST_PRIORITY" };
   return { allowed: true, createdAt, expiresAt: Math.min(createdAt + holdTtlMs, startsAt) };
 }
 

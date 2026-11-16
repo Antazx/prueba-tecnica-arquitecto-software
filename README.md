@@ -4,8 +4,9 @@ Implementación de la [prueba de arquitectura de software](docs/diagnostic-appoi
 Esta entrega permite consultar una agenda sintética validada, bloquear un hueco
 con exclusividad, confirmar o cancelar la reserva y caducar los bloqueos desde
 el worker. Cada liberación conserva su evento y publicación pendiente en
-PostgreSQL. La lista de espera, el transporte asíncrono y los avisos corresponden
-a las siguientes entregas.
+PostgreSQL. También permite alta, consulta y retirada de espera sin oferta,
+con FIFO persistido y prioridad frente a reserva directa. El transporte asíncrono,
+la adjudicación de ofertas y los avisos corresponden a las siguientes entregas.
 
 ## Diseño funcional acordado
 
@@ -107,8 +108,9 @@ AC59–AC64 cubren el bloqueo propio, otros ámbitos, vencimiento durante la esp
 replays e inscripción existente y la convivencia permitida. AC65–AC67 cubren
 Q25–Q26; AC68–AC69 hacen visibles límites ya aceptados de Q24 y del aviso.
 Están implementados la consulta de agenda, los bloqueos, su consulta propia,
-confirmación, cancelación y barrido de bloqueos vencidos con outbox. La lista de
-espera, las ofertas y la publicación/consumo de mensajería siguen pendientes.
+confirmación, cancelación y barrido de bloqueos vencidos con outbox, además del
+alta/consulta/retirada de espera sin oferta y su prioridad. Las ofertas y la
+publicación/consumo de mensajería siguen pendientes.
 
 ## Arranque con un comando
 
@@ -160,7 +162,9 @@ Es información orientativa: una reserva posterior deberá revalidarla.
 
 `directlyBookable` es falso si existe una reserva persistida en `HELD`, `OFFERED`
 o `CONFIRMED`, aunque haya vencido su plazo temporal. GET no materializa cierres.
-La prioridad elegible se añadirá cuando exista la inscripción en lista de espera.
+También es falso cuando hay una inscripción `WAITING` del ámbito que no excluyó
+ese hueco. La prioridad se deriva de inscripciones y exclusiones, sin un marcador
+persistente de adjudicación en el hueco; se mantiene con el consumidor detenido.
 
 ## Crear y consultar un bloqueo
 
@@ -180,7 +184,7 @@ el servidor. Devuelve `201` con `id`, `slotId`, estado `HELD`, `createdAt`,
 `expiresAt`, `startsAt` y `endsAt`. El vencimiento es el menor entre creación más
 diez minutos e inicio del hueco; desde la igualdad con el inicio no crea reserva.
 El mismo paciente puede bloquear más de un hueco; no se añade una unicidad por
-paciente ni se aplica aquí la futura regla de admisión Q24.
+paciente ni se aplica aquí la regla de admisión Q24.
 
 Guarda la clave antes del primer intento y conserva la misma para sus reintentos.
 Misma clave, paciente, operación y destino recuperan el cuerpo y el `201`
@@ -201,12 +205,13 @@ GET añade `evaluatedAt`, `temporal.expired`, `temporal.closurePending` y `actio
 Si un temporal ha vencido, informa cierre pendiente y deshabilita las acciones,
 sin modificar filas. Una confirmada no vence por su antiguo plazo. Las acciones
 describen permisos funcionales de Q26. Confirmar y cancelar vuelven a validar
-estado y tiempo; las operaciones de oferta se incorporarán con la lista de espera.
+estado y tiempo; las operaciones de oferta se incorporarán en otra entrega.
 
 Cabecera ausente o inválida, paciente inexistente, clave ausente o cuerpo dan
 `400`; recurso inexistente o ajeno da el mismo `404 NOT_FOUND`. El POST responde
 `409 SLOT_OCCUPIED` si ya existe un ocupante, y `409 SLOT_STARTED` si se alcanzó
-el inicio. Los fallos transitorios identificables de PostgreSQL dan
+el inicio. Devuelve `409 WAITING_LIST_PRIORITY` si existe espera elegible para
+ese hueco libre. Los fallos transitorios identificables de PostgreSQL dan
 `503 DEPENDENCY_UNAVAILABLE` también en GET; otros errores internos conservan
 `500 INTERNAL_ERROR`. Puede reintentarse una creación incierta con su misma clave.
 
@@ -267,7 +272,7 @@ distinto del ID del evento; consumidor lógico (`allocation`), ciclo e intento
 iniciales se conservan como referencias separadas para las siguientes entregas.
 Las tablas se retienen sin purgas. La publicación no está conectada todavía:
 RabbitMQ inaccesible no impide guardar negocio y outbox, pero aún no hay revisión
-de lista ni avisos.
+de lista ni avisos a través del broker.
 
 Para acortar una demostración local puede configurarse `DIRECT_HOLD_TTL_MS` en la
 API, entre 1 y 600000 ms (predeterminado 600000). Nunca amplía el plazo de diez
@@ -299,6 +304,62 @@ docker compose logs --follow api worker
 
 El worker todavía no publica ni consume trabajos de outbox. Ya ejecuta el barrido
 de bloqueos directos y conserva las conexiones y su estado de disponibilidad.
+
+## Alta, consulta y retirada de espera
+
+```bash
+curl -X POST http://127.0.0.1:3000/waiting-list-entries \
+  -H 'Content-Type: application/json' \
+  -H 'X-Patient-Id: patient-ana' \
+  -H 'Idempotency-Key: ana-waiting-1' \
+  -d '{"hospitalId":"hospital-north","testTypeId":"mri"}'
+curl --fail http://127.0.0.1:3000/waiting-list-entries/ID_DEVUELTO \
+  -H 'X-Patient-Id: patient-ana'
+curl --fail -X POST http://127.0.0.1:3000/waiting-list-entries/ID_DEVUELTO/withdraw \
+  -H 'X-Patient-Id: patient-ana'
+```
+
+El alta exige la clave y únicamente hospital/tipo de prueba en el cuerpo. Primero
+recupera un éxito anterior con su código original. Para una clave nueva coordina
+el ámbito, bloquea las filas por orden estable y obtiene el reloj de PostgreSQL.
+Materializa los bloqueos propios vencidos, incluidos los huecos ya iniciados.
+Una inscripción realmente activa se devuelve con `200` y guarda ese éxito para
+la clave nueva, sin cambiar antigüedad ni exclusiones. Antes de una admisión
+nueva también cierra los bloqueos ajenos vencidos de huecos futuros.
+
+Q24 tiene precedencia: un `HELD` propio vigente del mismo ámbito responde
+`409 ACTIVE_HOLD_IN_SCOPE`. Sin él, si existe capacidad directamente reservable,
+responde `409 DIRECT_CAPACITY_AVAILABLE` con `slots` públicos: ID, ámbito e
+inicio/fin; esas referencias permiten continuar por el endpoint de bloqueo y no
+reservan nada. Ambos conflictos conservan las caducidades y liberaciones ya
+decididas, sin crear inscripción, prioridad latente ni éxito para la clave.
+Un bloqueo en otro ámbito no activa Q24. Tampoco lo activa una cita confirmada;
+no hay prohibición general de coexistencia entre reserva e inscripción.
+
+Si no hay impedimentos, `201` devuelve una inscripción `WAITING`, con ID nuevo,
+`admissionOrder` como entero decimal en texto, `createdAt`, ámbito y exclusiones.
+Bajo el bloqueo del ámbito, el siguiente orden es el máximo histórico más uno;
+la retención del historial y la unicidad de ámbito/orden conservan FIFO incluso
+con tiempos empatados. Un índice parcial asegura una sola inscripción activa
+por paciente y ámbito. Inscripción, éxito de clave y revisión durable se guardan
+juntos. El evento `AllocationReviewRequested` v1 incluye ámbito, inscripción y
+causa de admisión, con publicación pendiente para `allocation`. Si una liberación
+de esa misma transacción ya activa el ámbito, no se añade otro evento de revisión.
+
+GET solo permite consultar la inscripción propia bajo la identidad presentada.
+Añade `evaluatedAt`, evaluación temporal y `canWithdraw`; una espera sin oferta
+no tiene vencimiento ficticio y la consulta no escribe. Retirarse de `WAITING`
+cierra con causa `WITHDRAWN` y devuelve `200`. Repetir sobre una inscripción
+cerrada conserva su causa y no modifica otra inscripción posterior ni una cita.
+Reinscribirse tras el cierre usa una clave nueva y, si procede, identidad y orden
+nuevos. Repetir una clave exitosa sigue devolviendo su representación histórica;
+GET devuelve el estado actual. Una clave exitosa reutilizada para otro ámbito da
+`409 IDEMPOTENCY_KEY_REUSED`; las claves se separan por paciente y operación.
+
+Esta entrega no crea ofertas ni consume las activaciones. La asociación de oferta,
+su aceptación/rechazo, retirada con oferta y normalización de ofertas vencidas
+completan Q2/Q23/Q26 y los criterios compartidos en las entregas #8–#10. Los estados
+preparados para ofertas y las exclusiones no acreditan esos recorridos todavía.
 
 ## Desarrollo local
 
@@ -361,7 +422,10 @@ antes de soltarlo. Cubre tres pacientes competidores, ámbitos independientes,
 misma clave entre instancias, respuesta no leída y cruce del inicio durante la
 espera. Las transiciones añaden carreras de confirmación/cancelación/barrido,
 cruce real del vencimiento tras la barrera y un orden forzado donde el worker
-vence primero. Las fronteras exactas de igualdad y 1 ms se comprueban en reglas
+vence primero. La lista añade ambos órdenes de alta/directa y alta/liberación,
+claves iguales/distintas entre procesos y cruce del vencimiento del bloqueo
+propio con capacidad directa o prioridad previa de otro paciente. El consumidor
+permanece detenido: GET y POST siguen respetando la prioridad. Las fronteras exactas de igualdad y 1 ms se comprueban en reglas
 puras con tiempo explícito, sin atribuir fake timers de JavaScript a PostgreSQL.
 Los fallos SQL por permisos en la escritura final del resultado o de outbox
 acreditan rollback completo y permiten reintentar. El usuario SQL de esta base
@@ -483,9 +547,10 @@ ejercicio frente a detectar conflictos de varias escrituras al final.
 
 ## Alcance pendiente
 
-- Caducidad automática y materialización de cierres, confirmaciones,
-  cancelaciones y lista de espera con prioridad, ofertas y avisos asíncronos.
-- Transactional Outbox e Idempotent Consumer, acordados para la entrega funcional.
+- Adjudicación, aceptación/rechazo de ofertas, retirada con oferta y caducidad de
+  ofertas/reinscripción; completar sus criterios compartidos con el alta actual.
+- Relay de la outbox, consumidores idempotentes, avisos asíncronos, reintentos y DLQ.
+  Negocio y trabajo durable ya se guardan atómicamente en PostgreSQL.
 - Ampliar las suites y CI al entregar las siguientes funcionalidades. Herramientas
   adicionales de lint/formato siguen siendo propuestas.
 
@@ -496,8 +561,8 @@ mensaje recibido, en una cola efímera. Todavía no hay garantías de entrega de
 eventos de citación implementadas.
 
 La estrategia acordada para la siguiente fase funcional es entrega al menos una
-vez: cambio de negocio y evento pendiente se guardarán en una misma transacción;
-el publicador recuperará pendientes y confirmará su publicación. Una caída entre
+vez: cambio de negocio y evento pendiente ya se guardan en una misma transacción;
+el futuro publicador recuperará pendientes y confirmará su publicación. Una caída entre
 publicar y registrar el envío puede producir duplicados. El consumidor deduplicará
 el mensaje y aplicará su efecto en una misma transacción antes de reconocerlo.
 La validez de cada transición deberá comprobarse para gestionar mensajes que lleguen

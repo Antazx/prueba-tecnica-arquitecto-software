@@ -1,3 +1,4 @@
+import type { WaitingListEntry, WaitingListRepresentation, WaitingListScope, AdmissionState } from "./waiting-list.ts";
 import type { ReservationClosureReason, ReservationState } from "../domain/reservation.ts";
 
 export interface Reservation {
@@ -23,11 +24,17 @@ export interface ReservationRepresentation {
 }
 
 export interface CreationIdentity { patientId: string; operation: string; key: string }
-export interface CreationResult { fingerprint: string; status: 200 | 201; body: ReservationRepresentation }
-export interface ProtectedSlot { id: string; startsAt: number; endsAt: number; occupied: boolean }
+export interface CreationResult { fingerprint: string; status: 200 | 201; body: ReservationRepresentation | WaitingListRepresentation }
+export interface ProtectedSlot { id: string; startsAt: number; endsAt: number; occupied: boolean; waitingPriority?: boolean }
 
 // All methods in this callback share one transaction. No driver object crosses this boundary.
 export interface SchedulingTransaction {
+  lockWaitingListScope(scope: WaitingListScope): Promise<boolean>;
+  lockOwnWaitingListEntry(patientId: string, entryId: string): Promise<WaitingListEntry | null>;
+  closeWaitingListEntry(entryId: string, reason: NonNullable<WaitingListEntry["closureReason"]>): Promise<void>;
+  lockAdmissionState(scope: WaitingListScope): Promise<AdmissionState>;
+  insertWaitingListEntry(id: string, patientId: string, scope: WaitingListScope, createdAt: number): Promise<WaitingListEntry>;
+  recordAllocationReview(scope: WaitingListScope, entryId: string, occurredAt: number): Promise<void>;
   patientExists(patientId: string): Promise<boolean>;
   coordinateCreation(identity: CreationIdentity): Promise<CreationResult | null>;
   lockSlotForHold(slotId: string): Promise<ProtectedSlot | null>;
@@ -41,6 +48,7 @@ export interface SchedulingTransaction {
 
 export interface Scheduling {
   transaction<T>(work: (transaction: SchedulingTransaction) => Promise<T>): Promise<T>;
+  readOwnWaitingListEntry(patientId: string, entryId: string): Promise<{ entry: WaitingListEntry; evaluatedAt: number } | null>;
   dueDirectHolds(): Promise<{ id: string; patientId: string }[]>;
   patientExists(patientId: string): Promise<boolean>;
   readOwnReservation(patientId: string, reservationId: string): Promise<{ reservation: Reservation; evaluatedAt: number } | null>;

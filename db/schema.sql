@@ -45,6 +45,33 @@ CREATE TABLE IF NOT EXISTS scheduling.demo_seed (
     validated boolean NOT NULL DEFAULT false
 );
 
+CREATE TABLE IF NOT EXISTS scheduling.waiting_list_entries (
+    id uuid PRIMARY KEY,
+    patient_id text NOT NULL REFERENCES scheduling.patients(id),
+    hospital_id text NOT NULL,
+    test_type_id text NOT NULL,
+    admission_order bigint NOT NULL CHECK (admission_order > 0),
+    state text NOT NULL CHECK (state IN ('WAITING', 'OFFERED', 'CLOSED')),
+    closure_reason text CHECK (closure_reason IN ('ACCEPTED', 'EXPIRED', 'WITHDRAWN')),
+    created_at timestamptz NOT NULL,
+    CHECK (created_at = date_trunc('milliseconds', created_at)),
+    CHECK ((state = 'CLOSED') = (closure_reason IS NOT NULL)),
+    FOREIGN KEY (hospital_id, test_type_id) REFERENCES scheduling.waiting_list_scopes(hospital_id, test_type_id),
+    UNIQUE (hospital_id, test_type_id, admission_order)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS entries_one_active_patient_scope_idx
+    ON scheduling.waiting_list_entries(patient_id, hospital_id, test_type_id) WHERE state IN ('WAITING', 'OFFERED');
+CREATE INDEX IF NOT EXISTS entries_waiting_scope_order_idx
+    ON scheduling.waiting_list_entries(hospital_id, test_type_id, admission_order) WHERE state = 'WAITING';
+CREATE INDEX IF NOT EXISTS entries_test_type_idx ON scheduling.waiting_list_entries(test_type_id);
+
+CREATE TABLE IF NOT EXISTS scheduling.waiting_list_slot_exclusions (
+    entry_id uuid NOT NULL REFERENCES scheduling.waiting_list_entries(id),
+    slot_id text NOT NULL REFERENCES scheduling.slots(id),
+    PRIMARY KEY (entry_id, slot_id)
+);
+CREATE INDEX IF NOT EXISTS exclusions_slot_idx ON scheduling.waiting_list_slot_exclusions(slot_id);
+
 CREATE TABLE IF NOT EXISTS scheduling.reservations (
     id uuid PRIMARY KEY,
     slot_id text NOT NULL REFERENCES scheduling.slots(id),

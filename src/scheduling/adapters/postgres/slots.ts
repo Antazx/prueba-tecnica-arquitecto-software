@@ -1,3 +1,4 @@
+import { waitingListPrioritySql } from "./waiting-list.ts";
 import type { Pool } from "pg";
 import type { AgendaSnapshot, SlotQuery } from "../../application/agenda.ts";
 import { storageError } from "./errors.ts";
@@ -24,7 +25,7 @@ export async function listSlots(pool: Pool, query: SlotQuery): Promise<AgendaSna
     SELECT e.at AS evaluated_at, s.id, s.resource_id, s.hospital_id,
            s.test_type_id, s.starts_at, s.ends_at,
            NOT EXISTS (SELECT 1 FROM scheduling.reservations r WHERE r.slot_id = s.id
-             AND r.state IN ('HELD', 'OFFERED', 'CONFIRMED')) AS directly_bookable
+             AND r.state IN ('HELD', 'OFFERED', 'CONFIRMED')) AND NOT ${waitingListPrioritySql} AS directly_bookable
     FROM evaluation e
     LEFT JOIN scheduling.slots s
       ON s.hospital_id = $1 AND s.test_type_id = $2

@@ -25,6 +25,30 @@ export function buildApi(checkPostgres: () => Promise<void>, readAgenda: AgendaR
     const id = { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$" };
     const patientHeaders = { type: "object", required: ["x-patient-id"], properties: { "x-patient-id": id } };
     const params = { type: "object", required: ["id"], properties: { id }, additionalProperties: false };
+    api.get<{ Params: { id: string }; Headers: { "x-patient-id": string } }>("/waiting-list-entries/:id", {
+      schema: { params, headers: patientHeaders },
+    }, async (request, reply) => {
+      const result = await scheduling.getWaitingListEntry(request.headers["x-patient-id"], request.params.id);
+      return reply.code(result.status).send(result.body);
+    });
+    api.post<{ Params: { id: string }; Headers: { "x-patient-id": string } }>("/waiting-list-entries/:id/withdraw", {
+      schema: { params, headers: patientHeaders },
+    }, async (request, reply) => {
+      if (request.body !== undefined) return reply.code(400).send({ code: "BODY_NOT_ALLOWED" });
+      const result = await scheduling.withdrawWaitingListEntry(request.headers["x-patient-id"], request.params.id);
+      return reply.code(result.status).send(result.body);
+    });
+    api.post<{ Body: { hospitalId: string; testTypeId: string }; Headers: { "x-patient-id": string; "idempotency-key": string } }>("/waiting-list-entries", {
+      schema: {
+        headers: { ...patientHeaders, required: ["x-patient-id", "idempotency-key"], properties: {
+          ...patientHeaders.properties, "idempotency-key": { type: "string", minLength: 1, maxLength: 200, pattern: "^[!-~]+$" },
+        } },
+        body: { type: "object", required: ["hospitalId", "testTypeId"], properties: { hospitalId: id, testTypeId: id }, additionalProperties: false },
+      },
+    }, async (request, reply) => {
+      const result = await scheduling.joinWaitingList(request.headers["x-patient-id"], request.body, request.headers["idempotency-key"]);
+      return reply.code(result.status).send(result.body);
+    });
     api.post<{ Params: { id: string }; Headers: { "x-patient-id": string; "idempotency-key": string } }>("/slots/:id/holds", {
       schema: { params, headers: {
         ...patientHeaders,
