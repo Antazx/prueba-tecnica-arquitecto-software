@@ -44,3 +44,31 @@ CREATE TABLE IF NOT EXISTS scheduling.demo_seed (
     agenda_starts_at timestamptz NOT NULL,
     validated boolean NOT NULL DEFAULT false
 );
+
+CREATE TABLE IF NOT EXISTS scheduling.reservations (
+    id uuid PRIMARY KEY,
+    slot_id text NOT NULL REFERENCES scheduling.slots(id),
+    patient_id text NOT NULL REFERENCES scheduling.patients(id),
+    state text NOT NULL CHECK (state IN ('HELD', 'OFFERED', 'CONFIRMED', 'CANCELLED', 'EXPIRED')),
+    created_at timestamptz NOT NULL,
+    expires_at timestamptz NOT NULL,
+    CHECK (created_at < expires_at),
+    CHECK (created_at = date_trunc('milliseconds', created_at)),
+    CHECK (expires_at = date_trunc('milliseconds', expires_at))
+);
+-- Expiry alone does not release occupancy; a writer must persist the closure.
+CREATE UNIQUE INDEX IF NOT EXISTS reservations_one_occupant_idx ON scheduling.reservations(slot_id)
+    WHERE state IN ('HELD', 'OFFERED', 'CONFIRMED');
+CREATE INDEX IF NOT EXISTS reservations_patient_idx ON scheduling.reservations(patient_id);
+
+CREATE TABLE IF NOT EXISTS scheduling.http_creation_results (
+    patient_id text NOT NULL REFERENCES scheduling.patients(id),
+    operation text NOT NULL,
+    idempotency_key text NOT NULL,
+    fingerprint text,
+    status_code integer,
+    response_body jsonb,
+    PRIMARY KEY (patient_id, operation, idempotency_key),
+    CHECK ((fingerprint IS NULL AND status_code IS NULL AND response_body IS NULL) OR
+           (fingerprint IS NOT NULL AND status_code IS NOT NULL AND status_code IN (200, 201) AND response_body IS NOT NULL))
+);
