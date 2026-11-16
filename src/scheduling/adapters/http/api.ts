@@ -3,6 +3,7 @@ import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
 import { agendaSchema } from "./agenda-schema.ts";
 import { liveSchema, readySchema } from "./health-schemas.ts";
+import { holdSchema, getReservationSchema, confirmReservationSchema, cancelReservationSchema, reservationSchema, heldReservationSchema, confirmedReservationSchema, cancelledReservationSchema, reservationEvaluationSchema } from "./reservation-schemas.ts";
 import type { AgendaReader } from "../../application/agenda.ts";
 import { parseExternalInstant } from "../../domain/instant.ts";
 import type { SchedulingUseCases } from "../../application/reservations.ts";
@@ -41,6 +42,11 @@ export function buildApi(checkPostgres: () => Promise<void>, readAgenda: AgendaR
     api.get("/openapi.json", { schema: { hide: true } }, async () => api.swagger());
 
     if (scheduling) {
+      api.addSchema(reservationSchema);
+      api.addSchema(heldReservationSchema);
+      api.addSchema(reservationEvaluationSchema);
+      api.addSchema(confirmedReservationSchema);
+      api.addSchema(cancelledReservationSchema);
       const id = { type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$" };
       const patientHeaders = { type: "object", required: ["x-patient-id"], properties: { "x-patient-id": id } };
       const params = { type: "object", required: ["id"], properties: { id }, additionalProperties: false };
@@ -69,11 +75,7 @@ export function buildApi(checkPostgres: () => Promise<void>, readAgenda: AgendaR
         return reply.code(result.status).send(result.body);
       });
       api.post<{ Params: { id: string }; Headers: { "x-patient-id": string; "idempotency-key": string } }>("/slots/:id/holds", {
-        schema: { params, headers: {
-          ...patientHeaders,
-          required: ["x-patient-id", "idempotency-key"],
-          properties: { ...patientHeaders.properties, "idempotency-key": { type: "string", minLength: 1, maxLength: 200, pattern: "^[!-~]+$" } },
-        } },
+        schema: holdSchema,
       }, async (request, reply) => {
         // Ownership and deadline come exclusively from the presented identity and the server.
         if (request.body !== undefined) return reply.code(400).send({ code: "BODY_NOT_ALLOWED" });
@@ -81,7 +83,7 @@ export function buildApi(checkPostgres: () => Promise<void>, readAgenda: AgendaR
         return reply.code(result.status).send(result.body);
       });
       api.post<{ Params: { id: string }; Headers: { "x-patient-id": string } }>("/reservations/:id/confirm", {
-        schema: { params, headers: patientHeaders },
+        schema: confirmReservationSchema,
       }, async (request, reply) => {
         if (request.body !== undefined) return reply.code(400).send({ code: "BODY_NOT_ALLOWED" });
         const result = await scheduling.confirmReservation(request.headers["x-patient-id"], request.params.id);
@@ -95,14 +97,14 @@ export function buildApi(checkPostgres: () => Promise<void>, readAgenda: AgendaR
         return reply.code(result.status).send(result.body);
       });
       api.post<{ Params: { id: string }; Headers: { "x-patient-id": string } }>("/reservations/:id/cancel", {
-        schema: { params, headers: patientHeaders },
+        schema: cancelReservationSchema,
       }, async (request, reply) => {
         if (request.body !== undefined) return reply.code(400).send({ code: "BODY_NOT_ALLOWED" });
         const result = await scheduling.cancelReservation(request.headers["x-patient-id"], request.params.id);
         return reply.code(result.status).send(result.body);
       });
       api.get<{ Params: { id: string }; Headers: { "x-patient-id": string } }>("/reservations/:id", {
-        schema: { params, headers: patientHeaders },
+        schema: getReservationSchema,
       }, async (request, reply) => {
         const result = await scheduling.getReservation(request.headers["x-patient-id"], request.params.id);
         return reply.code(result.status).send(result.body);

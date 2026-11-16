@@ -60,11 +60,11 @@ con la aplicación, sin CDN ni envío a un validador externo.
 curl --fail http://127.0.0.1:3000/openapi.json -o /tmp/diagnostic-openapi.json
 ```
 
-Esta entrega documenta `GET /health/live`, `GET /health/ready` y `GET /slots`.
-Las ocho operaciones de reservas y lista de espera siguen disponibles por HTTP;
-su incorporación al contrato se completa en las entregas #18 y #19. La prueba de
+Esta entrega documenta salud, agenda, creación de bloqueos, consulta de reservas,
+confirmación y cancelación. Las cuatro operaciones de lista de espera y rechazo
+de ofertas siguen disponibles por HTTP; su contrato se completa en #19. La prueba de
 cobertura captura las once operaciones de la aplicación completa mediante
-`onRoute`: las tres cubiertas y las ocho pendientes son explícitas. Los HEAD que
+`onRoute`: las siete cubiertas y las cuatro pendientes son explícitas. Los HEAD que
 Fastify deriva copiando el manejador y esquema GET se registran por separado;
 un HEAD con manejador propio sigue siendo una operación pública. Las rutas de
 artefactos documentales se comprueban aparte.
@@ -78,6 +78,38 @@ una fotografía; consultar no reserva capacidad. Borra un parámetro obligatorio
 para observar `400 INVALID_REQUEST`; un instante sin zona devuelve
 `400 INVALID_INTERVAL` con su mensaje.
 
+Para recorrer las reservas desde Swagger UI, parte de una demo recién creada:
+
+1. Ejecuta `GET /slots` con los parámetros de `hospital-north/mri` anteriores.
+   Copia el `id` de un hueco futuro con `directlyBookable: true`; por ejemplo,
+   `slot-north-mri-1` si aún está libre. Ese es el `id` de la ruta de creación.
+2. En `POST /slots/{id}/holds`, presenta `X-Patient-Id: patient-bruno` e
+   `Idempotency-Key: demo-bruno-docs-hold-1`, sin cuerpo. Guarda la clave antes de
+   ejecutar. El `201` contiene una reserva `HELD`: copia su `id`, distinto al del
+   hueco, y observa `expiresAt` y `startsAt`.
+3. Ejecuta `GET /reservations/{id}` con ese ID de reserva y la misma identidad.
+   Conserva los campos de la reserva y añade `evaluatedAt`, `temporal` y `actions`.
+   Consultar no escribe ni amplía el plazo. Un bloqueo vencido aún pendiente de
+   cierre puede seguir `HELD` con `expired` y `closurePending` verdaderos.
+4. Antes de `expiresAt`, ejecuta `POST /reservations/{id}/confirm`, con la misma
+   identidad, sin cuerpo y sin clave obligatoria. El `200` devuelve el mismo ID
+   en estado `CONFIRMED`. Su antiguo `expiresAt` se conserva y ya no lo caduca.
+5. Antes de `startsAt`, ejecuta `POST /reservations/{id}/cancel` del mismo modo.
+   El `200` devuelve esa reserva `CANCELLED`. Puedes repetir la cancelación,
+   también después del inicio; una confirmación posterior devuelve `409` con la
+   reserva cancelada completa y `code: RESERVATION_STATE_CONFLICT`.
+
+El bloqueo dura como máximo diez minutos y nunca más allá del inicio del hueco;
+la igualdad ya vence. La decisión revalida tiempo y estado. Confirmar o cancelar
+un bloqueo tarde puede comprometer su cierre `EXPIRED` y responder `409
+RESERVATION_EXPIRED`. Repetir la creación con la misma identidad, operación,
+clave y hueco conserva el cuerpo y código exitosos originales, incluso después
+de cancelar: es un replay histórico; consulta el GET para conocer el estado actual.
+Otro hueco con esa clave da `409 IDEMPOTENCY_KEY_REUSED`. Las claves son
+independientes por paciente y operación y los errores no se guardan como éxitos.
+Usa una clave nueva para una nueva intención. Todos los ejemplos usan identidades
+sintéticas falsificables, sin autenticación real.
+
 Versiones exactas: `@fastify/swagger` 9.9.3 y `@fastify/swagger-ui` 6.1.4
 (incorpora Swagger UI 5.34.0). El generador
 [incorporó OpenAPI 3.2 en 9.9.0](https://github.com/fastify/fastify-swagger/releases/tag/v9.9.0)
@@ -90,8 +122,11 @@ además que el verificador rechaza referencias rotas, esquemas inválidos y
 respuestas incompatibles. Fastify y el resto del stack conservan sus versiones.
 
 `pnpm test` ejecuta documento, interfaz, inventario y salud/errores controlados;
-`pnpm test:integration` contrasta también las consultas y errores de agenda con
-PostgreSQL real. Ambos forman parte de la CI existente, junto con `pnpm typecheck`
+`pnpm test:integration` contrasta también agenda, bloqueos, consultas de reserva,
+confirmación, cancelación, replay y conflictos con PostgreSQL real. Se conservan
+las comprobaciones de estado, plazos, persistencia y rollback existentes, además
+de validar código, tipo de contenido y cuerpo contra el contrato. Ambos forman
+parte de la CI existente, junto con `pnpm typecheck`
 y `pnpm build`. Los errores provocados en la frontera de dependencias comprueban
 la representación HTTP, sin acreditar disponibilidad real de PostgreSQL.
 

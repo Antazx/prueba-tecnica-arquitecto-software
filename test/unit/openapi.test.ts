@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { readApiContract, expectContractResponse, captureApiRoutes, expectContractCoverage, validateApiDocument } from "../helpers/openapi.ts";
 import { schedulingUseCases } from "../../src/scheduling/application/reservations.ts";
 import { postgresScheduling } from "../../src/scheduling/adapters/postgres/scheduling.ts";
@@ -14,6 +14,131 @@ function api() {
   apis.push(app);
   return app;
 }
+
+function schedulingApi() {
+  const app = buildApi(async () => {}, async () => ({ evaluatedAt: "2030-01-01T00:00:00.000Z", slots: [] }), schedulingUseCases(postgresScheduling(createDatabasePool("postgresql://synthetic:synthetic@127.0.0.1:1/synthetic"))));
+  apis.push(app);
+  return app;
+}
+
+it("publishes the current reservation query with synthetic identity and evaluated temporal state", async () => {
+  const document = await readApiContract(schedulingApi());
+  const operation = document.paths["/reservations/{id}"]?.get;
+  expect(operation).toBeDefined();
+  expect(Object.keys(operation.responses).sort()).toEqual(["200", "400", "404", "500", "503"]);
+  expect(operation.parameters).toEqual(expect.arrayContaining([
+    expect.objectContaining({ name: "id", in: "path", required: true, schema: expect.objectContaining({ minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$" }) }),
+    expect.objectContaining({ name: "x-patient-id", in: "header", required: true }),
+  ]));
+  expect(operation.parameters).toHaveLength(2);
+  const schema = operation.responses["200"].content!["application/json"].schema;
+  expect(schema).toMatchObject({
+    required: expect.arrayContaining(["id", "slotId", "state", "createdAt", "expiresAt", "startsAt", "endsAt", "evaluatedAt", "temporal", "actions"]),
+    additionalProperties: false,
+    properties: {
+      state: { enum: ["HELD", "OFFERED", "CONFIRMED", "CANCELLED", "EXPIRED"] },
+      temporal: { required: ["expired", "closurePending"], additionalProperties: false },
+      actions: { required: ["canConfirm", "canCancel", "canRejectOffer"], additionalProperties: false },
+    },
+  });
+  for (const meaning of ["evaluatedAt", "closurePending", "no escribe", "CONFIRMED", "igualdad", "falsificable"]) expect(operation.description).toContain(meaning);
+});
+
+it("publishes confirmation without a required idempotency key and retains reservation conflicts", async () => {
+  const document = await readApiContract(schedulingApi());
+  const operation = document.paths["/reservations/{id}/confirm"]?.post;
+  expect(operation).toBeDefined();
+  expect(operation).not.toHaveProperty("requestBody");
+  expect(operation.parameters?.map(({ name, in: location }) => `${location}:${name}`).sort()).toEqual(["header:x-patient-id", "path:id"]);
+  expect(Object.keys(operation.responses).sort()).toEqual(["200", "400", "404", "409", "500", "503"]);
+  expect(operation.responses["200"].content!["application/json"].schema).toMatchObject({ additionalProperties: false, properties: { state: { enum: ["CONFIRMED"] } } });
+  expect(operation.responses["409"].content!["application/json"].schema).toMatchObject({
+    oneOf: [
+      { required: expect.arrayContaining(["id", "slotId", "state", "createdAt", "expiresAt", "startsAt", "endsAt", "code"]), additionalProperties: false, properties: { state: { enum: ["EXPIRED"] }, code: { enum: ["RESERVATION_EXPIRED"] } } },
+      { required: expect.arrayContaining(["id", "state", "code"]), additionalProperties: false, properties: { state: { enum: ["CANCELLED"] }, code: { enum: ["RESERVATION_STATE_CONFLICT"] } } },
+    ],
+  });
+  for (const meaning of ["misma identidad", "estado actual", "CANCELLED", "comprometerse", "igualdad"]) expect(operation.description).toContain(meaning);
+});
+
+it("publishes cancellation with its real terminal and started-appointment conflicts", async () => {
+  const document = await readApiContract(schedulingApi());
+  const operation = document.paths["/reservations/{id}/cancel"]?.post;
+  expect(operation).toBeDefined();
+  expect(operation).not.toHaveProperty("requestBody");
+  expect(operation.parameters?.map(({ name, in: location }) => `${location}:${name}`).sort()).toEqual(["header:x-patient-id", "path:id"]);
+  expect(Object.keys(operation.responses).sort()).toEqual(["200", "400", "404", "409", "500", "503"]);
+  expect(operation.responses["200"].content!["application/json"].schema).toMatchObject({ additionalProperties: false, properties: { state: { enum: ["CANCELLED"] } } });
+  expect(operation.responses["409"].content!["application/json"].schema).toMatchObject({
+    oneOf: expect.arrayContaining([
+      expect.objectContaining({ required: expect.arrayContaining(["id", "slotId", "state", "createdAt", "expiresAt", "startsAt", "endsAt", "code"]), additionalProperties: false, properties: expect.objectContaining({ state: { type: "string", enum: ["CONFIRMED"] }, code: { type: "string", enum: ["APPOINTMENT_STARTED"] } }) }),
+      expect.objectContaining({ properties: expect.objectContaining({ state: { type: "string", enum: ["EXPIRED"] }, code: { type: "string", enum: ["RESERVATION_EXPIRED"] } }) }),
+      expect.objectContaining({ properties: expect.objectContaining({ state: { type: "string", enum: ["OFFERED"] }, code: { type: "string", enum: ["RESERVATION_STATE_CONFLICT"] } }) }),
+      expect.objectContaining({ properties: expect.objectContaining({ state: { type: "string", enum: ["CANCELLED"] }, code: { type: "string", enum: ["RESERVATION_STATE_CONFLICT"] } }) }),
+    ]),
+  });
+  for (const meaning of ["después del inicio", "OFFERED", "comprometerse", "Idempotency-Key"]) expect(operation.description).toContain(meaning);
+});
+
+it("publishes hold creation headers, no body and only its applicable responses", async () => {
+  const document = await readApiContract(schedulingApi());
+  const operation = document.paths["/slots/{id}/holds"].post;
+  expect(operation).not.toHaveProperty("requestBody");
+  expect(Object.keys(operation.responses).sort()).toEqual(["201", "400", "404", "409", "500", "503"]);
+  expect(operation.parameters).toEqual(expect.arrayContaining([
+    expect.objectContaining({ name: "x-patient-id", in: "header", required: true, schema: expect.objectContaining({ type: "string", minLength: 1, maxLength: 100, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$" }) }),
+    expect.objectContaining({ name: "idempotency-key", in: "header", required: true, schema: expect.objectContaining({ type: "string", minLength: 1, maxLength: 200, pattern: "^[!-~]+$" }) }),
+  ]));
+  expect(operation.parameters).toHaveLength(3);
+  for (const meaning of ["TTL", "10 minutos", "menor", "igualdad", "revalidan", "histórico", "no se guardan", "paciente y operación"]) expect(operation.description).toContain(meaning);
+});
+
+it.each([
+  { error: Object.assign(new Error("Synthetic PostgreSQL connection failure"), { code: "ECONNREFUSED" }), status: 503, code: "DEPENDENCY_UNAVAILABLE" },
+  { error: new Error("Synthetic unexpected database failure"), status: 500, code: "INTERNAL_ERROR" },
+])("validates reservation route errors at the database boundary: $status/$code", async ({ error, status, code }) => {
+  const pool = createDatabasePool("postgresql://synthetic:synthetic@127.0.0.1:1/synthetic");
+  vi.spyOn(pool, "connect").mockRejectedValue(error);
+  vi.spyOn(pool, "query").mockRejectedValue(error);
+  const app = buildApi(async () => {}, async () => ({ evaluatedAt: "2030-01-01T00:00:00.000Z", slots: [] }), schedulingUseCases(postgresScheduling(pool)));
+  apis.push(app);
+  try {
+    const document = await readApiContract(app);
+    for (const { method, path, url } of [
+      { method: "POST", path: "/slots/{id}/holds", url: "/slots/slot-north-mri-1/holds" },
+      { method: "GET", path: "/reservations/{id}", url: "/reservations/10000000-0000-4000-8000-000000000001" },
+      { method: "POST", path: "/reservations/{id}/confirm", url: "/reservations/10000000-0000-4000-8000-000000000001/confirm" },
+      { method: "POST", path: "/reservations/{id}/cancel", url: "/reservations/10000000-0000-4000-8000-000000000001/cancel" },
+    ] as const) {
+      const response = await app.inject({ method, url, headers: { "x-patient-id": "patient-ana", "idempotency-key": "synthetic-error" } });
+      expect(response.statusCode, path).toBe(status);
+      expect(response.json()).toEqual({ code });
+      expectContractResponse(document, method, path, response);
+    }
+  } finally { vi.restoreAllMocks(); await pool.end(); }
+});
+
+it("preserves invalid identity and path responses on every documented reservation operation", async () => {
+  const app = schedulingApi();
+  const document = await readApiContract(app);
+  for (const { method, path, url } of [
+    { method: "POST", path: "/slots/{id}/holds", url: "/slots/ID/holds" },
+    { method: "GET", path: "/reservations/{id}", url: "/reservations/ID" },
+    { method: "POST", path: "/reservations/{id}/confirm", url: "/reservations/ID/confirm" },
+    { method: "POST", path: "/reservations/{id}/cancel", url: "/reservations/ID/cancel" },
+  ] as const) {
+    for (const headers of [{}, { "x-patient-id": "invalid patient" }, { "x-patient-id": "x".repeat(101) }]) {
+      const response = await app.inject({ method, url, headers: { ...headers, "idempotency-key": "synthetic-invalid" } });
+      expect(response.statusCode, path).toBe(400);
+      expect(response.json()).toEqual({ code: "INVALID_REQUEST" });
+      expectContractResponse(document, method, path, response);
+    }
+    const response = await app.inject({ method, url: url.replace("ID", "invalid%20id"), headers: { "x-patient-id": "patient-ana", "idempotency-key": "synthetic-invalid" } });
+    expect(response.statusCode, path).toBe(400);
+    expect(response.json()).toEqual({ code: "INVALID_REQUEST" });
+    expectContractResponse(document, method, path, response);
+  }
+});
 
 it("serves an independently valid OpenAPI 3.2.1 document generated from the API", async () => {
   const response = await api().inject({ url: "/openapi.json" });
@@ -98,17 +223,17 @@ it.each([
   expectContractResponse(document, "GET", "/slots", response);
 });
 
-it("tracks the three documented operations against the complete registered public API", async () => {
-  const app = buildApi(async () => {}, async () => ({ evaluatedAt: "2030-01-01T00:00:00.000Z", slots: [] }), schedulingUseCases(postgresScheduling(createDatabasePool("postgresql://synthetic:synthetic@127.0.0.1:1/synthetic"))));
-  apis.push(app);
+it("tracks the seven documented operations against the complete registered public API", async () => {
+  const app = schedulingApi();
   const inventory = captureApiRoutes(app);
   const document = await readApiContract(app);
   expectContractCoverage(document, inventory, [
     "GET /health/live", "GET /health/ready", "GET /slots",
+    "GET /reservations/{id}", "POST /slots/{id}/holds",
+    "POST /reservations/{id}/cancel", "POST /reservations/{id}/confirm",
   ], [
-    "GET /reservations/{id}", "GET /waiting-list-entries/{id}",
-    "POST /reservations/{id}/cancel", "POST /reservations/{id}/confirm", "POST /reservations/{id}/reject",
-    "POST /slots/{id}/holds", "POST /waiting-list-entries", "POST /waiting-list-entries/{id}/withdraw",
+    "GET /waiting-list-entries/{id}", "POST /reservations/{id}/reject",
+    "POST /waiting-list-entries", "POST /waiting-list-entries/{id}/withdraw",
   ]);
   expect(inventory.derivedHeads).toEqual(expect.arrayContaining(["HEAD /health/live", "HEAD /health/ready", "HEAD /slots"]));
 });

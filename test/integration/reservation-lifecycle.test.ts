@@ -5,13 +5,15 @@ import { initializeDatabase } from "../../src/scheduling/adapters/postgres/initi
 import { listSlots } from "../../src/scheduling/adapters/postgres/slots.ts";
 import { postgresScheduling } from "../../src/scheduling/adapters/postgres/scheduling.ts";
 import { schedulingUseCases } from "../../src/scheduling/application/reservations.ts";
+import { readApiContract, expectContractResponse } from "../helpers/openapi.ts";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (!databaseUrl) throw new Error("TEST_DATABASE_URL is required; use an isolated test database");
 const pool = createDatabasePool(databaseUrl);
 const useCases = schedulingUseCases(postgresScheduling(pool));
 const api = buildApi(() => Promise.resolve(), (query) => listSlots(pool, query), useCases);
-beforeAll(async () => { await initializeDatabase(pool); });
+let document: Awaited<ReturnType<typeof readApiContract>>;
+beforeAll(async () => { await initializeDatabase(pool); document = await readApiContract(api); });
 afterEach(async () => {
   await pool.query("DELETE FROM scheduling.http_creation_results WHERE idempotency_key LIKE 'lifecycle-test-%'");
   await pool.query("DELETE FROM scheduling.outbox_publications WHERE event_id IN (SELECT event_id FROM scheduling.reservation_closures WHERE reservation_id IN (SELECT id FROM scheduling.reservations WHERE slot_id LIKE 'lifecycle-test-%'))");
@@ -31,11 +33,14 @@ async function hold(name: string) {
     "x-patient-id": "patient-ana", "idempotency-key": slotId,
   } });
   expect(result.statusCode).toBe(201);
+  expectContractResponse(document, "POST", "/slots/{id}/holds", result);
   return result.json<{ id: string; slotId: string; state: string; expiresAt: string }>();
 }
-const transition = (id: string, action: "confirm" | "cancel", patientId = "patient-ana") => api.inject({
-  method: "POST", url: `/reservations/${id}/${action}`, headers: { "x-patient-id": patientId },
-});
+async function transition(id: string, action: "confirm" | "cancel", patientId = "patient-ana") {
+  const response = await api.inject({ method: "POST", url: `/reservations/${id}/${action}`, headers: { "x-patient-id": patientId } });
+  expectContractResponse(document, "POST", `/reservations/{id}/${action}`, response);
+  return response;
+}
 
 it("confirms the own hold in place and repeats confirmation after the previous TTL", async () => {
   const reservation = await hold("confirmation");
@@ -56,6 +61,10 @@ it("commits expiry and one durable release even when late confirmation responds 
     expect(response.statusCode).toBe(409);
     expect(response.json()).toMatchObject({ id: reservation.id, state: "EXPIRED", code: "RESERVATION_EXPIRED" });
   }
+  const expired = await api.inject({ url: `/reservations/${reservation.id}`, headers: { "x-patient-id": "patient-ana" } });
+  expect(expired.statusCode).toBe(200);
+  expect(expired.json()).toMatchObject({ state: "EXPIRED", temporal: { expired: false, closurePending: false }, actions: { canConfirm: false, canCancel: false, canRejectOffer: false } });
+  expectContractResponse(document, "GET", "/reservations/{id}", expired);
   expect((await pool.query("SELECT state FROM scheduling.reservations WHERE id = $1", [reservation.id])).rows[0].state).toBe("EXPIRED");
   const events = (await pool.query(`SELECT e.id, e.type, e.payload, p.id AS publication_id, p.consumer, p.cycle, p.attempt, p.published_at
     FROM scheduling.events e JOIN scheduling.outbox_publications p ON p.event_id = e.id WHERE e.payload->>'reservationId' = $1`, [reservation.id])).rows;
@@ -75,6 +84,7 @@ it("cancels and repeats only R1, while reconfirmation reports its current CANCEL
     "x-patient-id": "patient-bruno", "idempotency-key": "lifecycle-test-replacement",
   } });
   expect(replacement.statusCode).toBe(201);
+  expectContractResponse(document, "POST", "/slots/{id}/holds", replacement);
   for (const action of ["confirm", "cancel"] as const) {
     const response = await transition(reservation.id, action);
     expect(response.statusCode).toBe(action === "confirm" ? 409 : 200);
@@ -135,6 +145,7 @@ it("rolls back state, closure and logical event when SQL cannot store the outbox
     const response = await failingApi.inject({ method: "POST", url: `/reservations/${reservation.id}/cancel`, headers: { "x-patient-id": "patient-ana" } });
     expect(response.statusCode).toBe(500);
     expect(response.json()).toEqual({ code: "INTERNAL_ERROR" });
+    expectContractResponse(document, "POST", "/reservations/{id}/cancel", response);
     expect((await pool.query("SELECT state FROM scheduling.reservations WHERE id = $1", [reservation.id])).rows[0].state).toBe("HELD");
     expect((await pool.query("SELECT * FROM scheduling.reservation_closures WHERE reservation_id = $1", [reservation.id])).rows).toEqual([]);
     expect((await pool.query("SELECT * FROM scheduling.events WHERE payload->>'reservationId' = $1", [reservation.id])).rows).toEqual([]);
@@ -157,11 +168,13 @@ it("keeps own GET evaluation free of writes before and after expiry with outbox 
   try {
     const before = await get();
     expect(before.statusCode).toBe(200);
+    expectContractResponse(document, "GET", "/reservations/{id}", before);
     expect(before.json()).toMatchObject({ state: "HELD", temporal: { expired: false, closurePending: false }, actions: { canConfirm: true, canCancel: true } });
     await pool.query("UPDATE scheduling.reservations SET created_at = created_at - interval '20 minutes', expires_at = expires_at - interval '20 minutes' WHERE id = $1", [reservation.id]);
     const persisted = (await pool.query("SELECT * FROM scheduling.reservations WHERE id = $1", [reservation.id])).rows;
     const after = await get();
     expect(after.statusCode).toBe(200);
+    expectContractResponse(document, "GET", "/reservations/{id}", after);
     expect(after.json()).toMatchObject({ state: "HELD", temporal: { expired: true, closurePending: true }, actions: { canConfirm: false, canCancel: false } });
     expect(Date.parse(after.json().evaluatedAt)).toBeGreaterThanOrEqual(Date.parse(after.json().expiresAt));
     expect((await pool.query("SELECT * FROM scheduling.reservations WHERE id = $1", [reservation.id])).rows).toEqual(persisted);
@@ -175,9 +188,16 @@ it("protects ownership, rejects contradictory bodies and leaves offered reservat
     expect((await transition(reservation.id, action, "patient-bruno")).statusCode).toBe(404);
     expect((await transition("missing-reservation", action)).statusCode).toBe(404);
     expect((await transition(reservation.id, action, "missing-patient")).statusCode).toBe(400);
-    expect((await api.inject({ method: "POST", url: `/reservations/${reservation.id}/${action}`, headers: { "x-patient-id": "patient-ana" }, payload: { patientId: "patient-bruno" } })).statusCode).toBe(400);
+    const body = await api.inject({ method: "POST", url: `/reservations/${reservation.id}/${action}`, headers: { "x-patient-id": "patient-ana" }, payload: { patientId: "patient-bruno" } });
+    expect(body.statusCode).toBe(400);
+    expect(body.json()).toEqual({ code: "BODY_NOT_ALLOWED" });
+    expectContractResponse(document, "POST", `/reservations/{id}/${action}`, body);
   }
   await pool.query("UPDATE scheduling.reservations SET state = 'OFFERED' WHERE id = $1", [reservation.id]);
+  const current = await api.inject({ url: `/reservations/${reservation.id}`, headers: { "x-patient-id": "patient-ana" } });
+  expect(current.statusCode).toBe(200);
+  expect(current.json()).toMatchObject({ state: "OFFERED", temporal: { expired: false, closurePending: false }, actions: { canConfirm: true, canCancel: false, canRejectOffer: true } });
+  expectContractResponse(document, "GET", "/reservations/{id}", current);
   const offered = await transition(reservation.id, "cancel");
   expect(offered.statusCode).toBe(409);
   expect(offered.json()).toMatchObject({ id: reservation.id, state: "OFFERED", code: "RESERVATION_STATE_CONFLICT" });

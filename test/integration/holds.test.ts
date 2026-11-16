@@ -6,12 +6,14 @@ import { initializeDatabase } from "../../src/scheduling/adapters/postgres/initi
 import { listSlots } from "../../src/scheduling/adapters/postgres/slots.ts";
 import { postgresScheduling } from "../../src/scheduling/adapters/postgres/scheduling.ts";
 import { schedulingUseCases } from "../../src/scheduling/application/reservations.ts";
+import { readApiContract, expectContractResponse } from "../helpers/openapi.ts";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (!databaseUrl) throw new Error("TEST_DATABASE_URL is required; use an isolated test database");
 const pool = createDatabasePool(databaseUrl);
 const api = buildApi(() => Promise.resolve(), (query) => listSlots(pool, query), schedulingUseCases(postgresScheduling(pool)));
-beforeAll(async () => { await initializeDatabase(pool); });
+let document: Awaited<ReturnType<typeof readApiContract>>;
+beforeAll(async () => { await initializeDatabase(pool); document = await readApiContract(api); });
 afterEach(async () => {
   await pool.query("DELETE FROM scheduling.http_creation_results WHERE idempotency_key LIKE 'hold-test-%'");
   await pool.query("DELETE FROM scheduling.reservations WHERE slot_id LIKE 'hold-test-%'");
@@ -26,9 +28,13 @@ async function slot(id: string, offset = "3 days") {
       date_trunc('milliseconds', clock_timestamp()) + $2::interval + interval '30 minutes')`, [id, offset]);
 }
 
-const hold = (slotId: string, key: string, patientId = "patient-ana") => api.inject({
-  method: "POST", url: `/slots/${slotId}/holds`, headers: { "x-patient-id": patientId, "idempotency-key": key },
-});
+async function hold(slotId: string, key: string, patientId = "patient-ana") {
+  const response = await api.inject({
+    method: "POST", url: `/slots/${slotId}/holds`, headers: { "x-patient-id": patientId, "idempotency-key": key },
+  });
+  expectContractResponse(document, "POST", "/slots/{id}/holds", response);
+  return response;
+}
 
 it("creates a hold and lets only its presented synthetic owner consult it", async () => {
   await slot("hold-test-created");
@@ -39,11 +45,24 @@ it("creates a hold and lets only its presented synthetic owner consult it", asyn
   expect(Date.parse(reservation.expiresAt) - Date.parse(reservation.createdAt)).toBe(600_000);
   const own = await api.inject({ url: `/reservations/${reservation.id}`, headers: { "x-patient-id": "patient-ana" } });
   expect(own.statusCode).toBe(200);
+  expectContractResponse(document, "GET", "/reservations/{id}", own);
   expect(own.json()).toMatchObject({ ...reservation, temporal: { expired: false, closurePending: false }, actions: { canConfirm: true } });
   for (const id of [reservation.id, "missing-reservation"]) {
     const foreign = await api.inject({ url: `/reservations/${id}`, headers: { "x-patient-id": "patient-bruno" } });
     expect(foreign.statusCode).toBe(404);
+    expect(foreign.json()).toEqual({ code: "NOT_FOUND" });
+    expectContractResponse(document, "GET", "/reservations/{id}", foreign);
   }
+  const unknown = await api.inject({ url: `/reservations/${reservation.id}`, headers: { "x-patient-id": "missing-patient" } });
+  expect(unknown.statusCode).toBe(400);
+  expect(unknown.json()).toEqual({ code: "UNKNOWN_PATIENT" });
+  expectContractResponse(document, "GET", "/reservations/{id}", unknown);
+});
+
+it("returns the documented missing-slot response for a registered patient", async () => {
+  const response = await hold("hold-test-missing-slot", "hold-test-missing-key");
+  expect(response.statusCode).toBe(404);
+  expect(response.json()).toEqual({ code: "NOT_FOUND" });
 });
 
 it("replays the original successful representation and code after losing the response and after a state change", async () => {
@@ -55,7 +74,9 @@ it("replays the original successful representation and code after losing the res
   expect(replay.statusCode).toBe(201);
   expect(replay.json()).toEqual(lostResponse.json());
   const current = await api.inject({ url: `/reservations/${lostResponse.json().id}`, headers: { "x-patient-id": "patient-ana" } });
+  expect(current.statusCode).toBe(200);
   expect(current.json().state).toBe("CANCELLED");
+  expectContractResponse(document, "GET", "/reservations/{id}", current);
 });
 
 it("rejects an incompatible destination but keeps equal keys of different patients independent", async () => {
@@ -81,6 +102,7 @@ it("shows pending expiry without writing and conservatively keeps a persisted ex
   try {
     const response = await readOnlyApi.inject({ url: `/reservations/${id}`, headers: { "x-patient-id": "patient-ana" } });
     expect(response.statusCode).toBe(200);
+    expectContractResponse(document, "GET", "/reservations/{id}", response);
     expect(response.json()).toMatchObject({ state: "HELD", temporal: { expired: true, closurePending: true }, actions: { canConfirm: false, canCancel: false } });
     const agenda = await readOnlyApi.inject({ url: "/slots?hospitalId=hospital-north&testTypeId=mri&from=2020-01-01T00:00:00Z&to=2100-01-01T00:00:00Z" });
     expect(agenda.json().slots.find((entry: { id: string }) => entry.id === "hold-test-expired").directlyBookable).toBe(false);
@@ -114,6 +136,7 @@ it("rolls back the hold and key when the final SQL result write fails, then perm
     } });
     expect(response.statusCode).toBe(500);
     expect(response.json()).toEqual({ code: "INTERNAL_ERROR" });
+    expectContractResponse(document, "POST", "/slots/{id}/holds", response);
     expect((await pool.query("SELECT count(*)::integer AS count FROM scheduling.reservations WHERE slot_id = 'hold-test-rollback'")).rows[0].count).toBe(0);
     expect((await pool.query("SELECT count(*)::integer AS count FROM scheduling.http_creation_results WHERE idempotency_key = 'hold-test-rollback-key'")).rows[0].count).toBe(0);
     expect((await hold("hold-test-rollback", "hold-test-rollback-key")).statusCode).toBe(201);
@@ -137,7 +160,11 @@ it.each([
   { headers: { "x-patient-id": "patient-ana", "idempotency-key": "hold-test-body", "content-type": "application/unsupported" }, body: "invalid" },
 ])("rejects invalid synthetic identity, missing key or contradictory body %#", async ({ headers, body }) => {
   await slot("hold-test-invalid");
-  expect((await api.inject({ method: "POST", url: "/slots/hold-test-invalid/holds", headers, payload: body })).statusCode).toBe(400);
+  const response = await api.inject({ method: "POST", url: "/slots/hold-test-invalid/holds", headers, payload: body });
+  expect(response.statusCode).toBe(400);
+  expect(response.json()).toEqual({ code: headers["x-patient-id"] === "missing-patient" ? "UNKNOWN_PATIENT" :
+    body !== undefined && headers["content-type"] !== "application/unsupported" ? "BODY_NOT_ALLOWED" : "INVALID_REQUEST" });
+  expectContractResponse(document, "POST", "/slots/{id}/holds", response);
   expect((await hold("hold-test-invalid", "hold-test-valid-after-rejection", "patient-bruno")).statusCode).toBe(201);
 });
 
@@ -159,6 +186,8 @@ it("exposes a confirmed reservation without marking its previous deadline expire
     date_trunc('milliseconds', clock_timestamp()) - interval '20 minutes',
     date_trunc('milliseconds', clock_timestamp()) - interval '10 minutes')`, [id]);
   const response = await api.inject({ url: `/reservations/${id}`, headers: { "x-patient-id": "patient-ana" } });
+  expect(response.statusCode).toBe(200);
+  expectContractResponse(document, "GET", "/reservations/{id}", response);
   expect(response.json()).toMatchObject({ state: "CONFIRMED", temporal: { expired: false, closurePending: false }, actions: { canConfirm: true, canCancel: true } });
 });
 
@@ -172,6 +201,7 @@ it("returns identifiable 503 for a failed PostgreSQL connection on both read rou
       const response = await unavailableApi.inject({ url, headers: { "x-patient-id": "patient-ana" } });
       expect(response.statusCode).toBe(503);
       expect(response.json()).toEqual({ code: "DEPENDENCY_UNAVAILABLE" });
+      expectContractResponse(document, "GET", url.startsWith("/slots") ? "/slots" : "/reservations/{id}", response);
     }
   } finally { await unavailableApi.close(); await unavailable.end(); }
 });
