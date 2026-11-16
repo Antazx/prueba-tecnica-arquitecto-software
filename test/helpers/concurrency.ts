@@ -15,7 +15,7 @@ export async function eventually<T>(read: () => Promise<T>, ready: (value: T) =>
   throw new Error(`Condition not reached: ${JSON.stringify(value)}`);
 }
 
-async function freePort(): Promise<number> {
+export async function freePort(): Promise<number> {
   const server = createServer();
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
@@ -26,12 +26,12 @@ async function freePort(): Promise<number> {
 
 interface ApiProcess { child: ChildProcess; url: string; applicationName: string; logs: () => string }
 
-async function startApi(databaseUrl: string, applicationName: string): Promise<ApiProcess> {
+async function startApi(databaseUrl: string, applicationName: string, environment: NodeJS.ProcessEnv): Promise<ApiProcess> {
   const port = await freePort();
   const database = new URL(databaseUrl);
   database.searchParams.set("application_name", applicationName);
   const child = spawn(process.execPath, ["src/bootstrap/api.ts"], {
-    cwd: process.cwd(), env: { ...process.env, DATABASE_URL: database.toString(), HOST: "127.0.0.1", API_PORT: String(port) },
+    cwd: process.cwd(), env: { ...process.env, ...environment, DATABASE_URL: database.toString(), HOST: "127.0.0.1", API_PORT: String(port) },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let output = "";
@@ -58,10 +58,10 @@ async function stopApi(api: ApiProcess) {
   try { await exited; } finally { clearTimeout(timer); }
 }
 
-export async function startApiPair(databaseUrl: string, prefix: string) {
-  const a = await startApi(databaseUrl, `${prefix}-A`);
+export async function startApiPair(databaseUrl: string, prefix: string, environment: NodeJS.ProcessEnv = {}) {
+  const a = await startApi(databaseUrl, `${prefix}-A`, environment);
   try {
-    const b = await startApi(databaseUrl, `${prefix}-B`);
+    const b = await startApi(databaseUrl, `${prefix}-B`, environment);
     return { a, b, stop: async () => { await Promise.all([stopApi(a), stopApi(b)]); } };
   } catch (error) { await stopApi(a); throw error; }
 }

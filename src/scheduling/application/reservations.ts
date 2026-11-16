@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { decideDirectHold, evaluateReservation } from "../domain/reservation.ts";
+import { decideDirectHold, evaluateReservation, decideConfirmation, decideCancellation } from "../domain/reservation.ts";
 import type { Reservation, ReservationRepresentation, Scheduling } from "./scheduling.ts";
 
 function represent(reservation: Reservation): ReservationRepresentation {
@@ -12,7 +12,7 @@ function represent(reservation: Reservation): ReservationRepresentation {
   };
 }
 
-export function schedulingUseCases(scheduling: Scheduling) {
+export function schedulingUseCases(scheduling: Scheduling, options: { holdTtlMs?: number } = {}) {
   return {
     async createHold(patientId: string, slotId: string, key: string) {
       const identity = { patientId, operation: "create-hold", key };
@@ -27,7 +27,7 @@ export function schedulingUseCases(scheduling: Scheduling) {
         }
         const slot = await transaction.lockSlotForHold(slotId);
         if (!slot) return { status: 404, body: { code: "NOT_FOUND" } };
-        const decision = decideDirectHold(slot, await transaction.currentTime());
+        const decision = decideDirectHold(slot, await transaction.currentTime(), options.holdTtlMs);
         if (!decision.allowed) return { status: 409, body: { code: decision.code } };
         const reservation: Reservation = {
           id: randomUUID(), slotId, patientId, state: "HELD", createdAt: decision.createdAt,
@@ -38,6 +38,52 @@ export function schedulingUseCases(scheduling: Scheduling) {
         await transaction.saveCreationResult(identity, { fingerprint, status: 201, body });
         return { status: 201, body };
       });
+    },
+    async confirmReservation(patientId: string, reservationId: string) {
+      return scheduling.transaction(async (transaction) => {
+        if (!await transaction.patientExists(patientId)) return { status: 400, body: { code: "UNKNOWN_PATIENT" } };
+        const reservation = await transaction.lockOwnReservation(patientId, reservationId);
+        if (!reservation) return { status: 404, body: { code: "NOT_FOUND" } };
+        const evaluatedAt = await transaction.currentTime();
+        const decision = decideConfirmation(reservation, evaluatedAt);
+        if (decision.state !== reservation.state) {
+          await transaction.setReservationState(reservation.id, decision.state);
+          if (decision.state === "EXPIRED") await transaction.recordSlotRelease(reservation, "EXPIRED", evaluatedAt);
+        }
+        const body = represent({ ...reservation, state: decision.state });
+        return { status: decision.allowed ? 200 : 409, body: decision.allowed ? body : { ...body, code: decision.code } };
+      });
+    },
+    async cancelReservation(patientId: string, reservationId: string) {
+      return scheduling.transaction(async (transaction) => {
+        if (!await transaction.patientExists(patientId)) return { status: 400, body: { code: "UNKNOWN_PATIENT" } };
+        const reservation = await transaction.lockOwnReservation(patientId, reservationId);
+        if (!reservation) return { status: 404, body: { code: "NOT_FOUND" } };
+        const evaluatedAt = await transaction.currentTime();
+        const decision = decideCancellation(reservation, evaluatedAt);
+        if (decision.state !== reservation.state) {
+          await transaction.setReservationState(reservation.id, decision.state);
+          await transaction.recordSlotRelease(reservation, decision.state === "EXPIRED" ? "EXPIRED" : "CANCELLED", evaluatedAt);
+        }
+        const body = represent({ ...reservation, state: decision.state });
+        return { status: decision.allowed ? 200 : 409, body: decision.allowed ? body : { ...body, code: decision.code } };
+      });
+    },
+    async expireDirectHolds() {
+      let expiredCount = 0;
+      for (const candidate of await scheduling.dueDirectHolds()) {
+        const expired = await scheduling.transaction(async (transaction) => {
+          const reservation = await transaction.lockOwnReservation(candidate.patientId, candidate.id);
+          if (!reservation || reservation.state !== "HELD") return false;
+          const evaluatedAt = await transaction.currentTime();
+          if (!evaluateReservation(reservation, evaluatedAt).expired) return false;
+          await transaction.setReservationState(reservation.id, "EXPIRED");
+          await transaction.recordSlotRelease(reservation, "EXPIRED", evaluatedAt);
+          return true;
+        });
+        if (expired) expiredCount++;
+      }
+      return expiredCount;
     },
     async getReservation(patientId: string, reservationId: string) {
       if (!await scheduling.patientExists(patientId)) return { status: 400, body: { code: "UNKNOWN_PATIENT" } };

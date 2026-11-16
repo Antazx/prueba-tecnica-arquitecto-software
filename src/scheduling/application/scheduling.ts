@@ -1,10 +1,11 @@
-import type { ReservationState } from "../domain/reservation.ts";
+import type { ReservationClosureReason, ReservationState } from "../domain/reservation.ts";
 
 export interface Reservation {
   id: string;
   slotId: string;
   patientId: string;
   state: ReservationState;
+  closureReason?: ReservationClosureReason;
   createdAt: number;
   expiresAt: number;
   startsAt: number;
@@ -30,6 +31,9 @@ export interface SchedulingTransaction {
   patientExists(patientId: string): Promise<boolean>;
   coordinateCreation(identity: CreationIdentity): Promise<CreationResult | null>;
   lockSlotForHold(slotId: string): Promise<ProtectedSlot | null>;
+  lockOwnReservation(patientId: string, reservationId: string): Promise<Reservation | null>;
+  setReservationState(reservationId: string, state: ReservationState): Promise<void>;
+  recordSlotRelease(reservation: Reservation, reason: ReservationClosureReason, occurredAt: number): Promise<void>;
   currentTime(): Promise<number>;
   insertDirectHold(reservation: Reservation): Promise<void>;
   saveCreationResult(identity: CreationIdentity, result: CreationResult): Promise<void>;
@@ -37,6 +41,7 @@ export interface SchedulingTransaction {
 
 export interface Scheduling {
   transaction<T>(work: (transaction: SchedulingTransaction) => Promise<T>): Promise<T>;
+  dueDirectHolds(): Promise<{ id: string; patientId: string }[]>;
   patientExists(patientId: string): Promise<boolean>;
   readOwnReservation(patientId: string, reservationId: string): Promise<{ reservation: Reservation; evaluatedAt: number } | null>;
 }

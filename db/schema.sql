@@ -72,3 +72,36 @@ CREATE TABLE IF NOT EXISTS scheduling.http_creation_results (
     CHECK ((fingerprint IS NULL AND status_code IS NULL AND response_body IS NULL) OR
            (fingerprint IS NOT NULL AND status_code IS NOT NULL AND status_code IN (200, 201) AND response_body IS NOT NULL))
 );
+
+CREATE INDEX IF NOT EXISTS reservations_due_holds_idx ON scheduling.reservations(expires_at, id) WHERE state = 'HELD';
+
+-- A logical event survives every publication and delivery of that same work.
+CREATE TABLE IF NOT EXISTS scheduling.events (
+    id uuid PRIMARY KEY,
+    type text NOT NULL,
+    version integer NOT NULL CHECK (version > 0),
+    occurred_at timestamptz NOT NULL,
+    payload jsonb NOT NULL CHECK (jsonb_typeof(payload) = 'object')
+);
+
+CREATE TABLE IF NOT EXISTS scheduling.reservation_closures (
+    reservation_id uuid PRIMARY KEY REFERENCES scheduling.reservations(id),
+    reason text NOT NULL CHECK (reason IN ('CANCELLED', 'EXPIRED', 'OFFER_REJECTED', 'WITHDRAWN')),
+    closed_at timestamptz NOT NULL,
+    event_id uuid NOT NULL UNIQUE REFERENCES scheduling.events(id)
+);
+
+-- Publication identity is independent of logical event, consumer, cycle and attempt.
+CREATE TABLE IF NOT EXISTS scheduling.outbox_publications (
+    id uuid PRIMARY KEY,
+    event_id uuid NOT NULL REFERENCES scheduling.events(id),
+    consumer text NOT NULL,
+    cycle integer NOT NULL CHECK (cycle >= 0),
+    attempt integer NOT NULL CHECK (attempt BETWEEN 0 AND 3),
+    available_at timestamptz NOT NULL,
+    created_at timestamptz NOT NULL,
+    published_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS outbox_ready_idx ON scheduling.outbox_publications(available_at, created_at, id)
+    WHERE published_at IS NULL;
+CREATE INDEX IF NOT EXISTS outbox_event_idx ON scheduling.outbox_publications(event_id);
