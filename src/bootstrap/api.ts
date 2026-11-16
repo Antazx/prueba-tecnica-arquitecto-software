@@ -1,11 +1,15 @@
 import { readApiConfig } from "../config/environment.ts";
 import { buildApi } from "../scheduling/adapters/http/api.ts";
 import { checkDatabase, createDatabasePool } from "../scheduling/adapters/postgres/database.ts";
+import { initializeDatabase } from "../scheduling/adapters/postgres/initialize.ts";
+import { listSlots } from "../scheduling/adapters/postgres/slots.ts";
+import { postgresScheduling } from "../scheduling/adapters/postgres/scheduling.ts";
+import { schedulingUseCases } from "../scheduling/application/reservations.ts";
 
 async function main() {
   const config = readApiConfig();
   const pool = createDatabasePool(config.databaseUrl);
-  const api = buildApi(() => checkDatabase(pool));
+  const api = buildApi(() => checkDatabase(pool), (query) => listSlots(pool, query), schedulingUseCases(postgresScheduling(pool), { holdTtlMs: config.holdTtlMs }));
   pool.on("error", (error) => api.log.warn({ err: error }, "PostgreSQL connection lost"));
 
   let stopping = false;
@@ -25,6 +29,7 @@ async function main() {
   }
 
   try {
+    await initializeDatabase(pool);
     await api.listen({ host: config.host, port: config.port });
   } catch (error) {
     await stop();
