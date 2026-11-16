@@ -1,7 +1,7 @@
 name: recoletas-diagnostic-appointments
 
 x-application: &application
-  image: recoletas-diagnostic-appointments:local
+  image: ${APPLICATION_IMAGE:-recoletas-diagnostic-appointments:local}
   build: .
   init: true
   stop_grace_period: 15s
@@ -36,6 +36,8 @@ services:
       - "127.0.0.1:${RABBITMQ_PORT:-5672}:5672"
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
+      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
       interval: 5s
@@ -50,6 +52,7 @@ services:
       DATABASE_URL: postgresql://diagnostic:diagnostic_dev@postgres:5432/diagnostic_appointments
       HOST: 0.0.0.0
       API_PORT: 3000
+      DIRECT_HOLD_TTL_MS: ${DIRECT_HOLD_TTL_MS:-600000}
     ports:
       - "127.0.0.1:${API_PORT:-3000}:3000"
     depends_on:
@@ -69,6 +72,9 @@ services:
       RABBITMQ_URL: amqp://diagnostic:diagnostic_dev@rabbitmq:5672?heartbeat=10
       HOST: 0.0.0.0
       WORKER_HEALTH_PORT: 3001
+      RELAY_ENABLED: ${RELAY_ENABLED:-true}
+      OFFER_MAXIMUM_MS: ${OFFER_MAXIMUM_MS:-7200000}
+      EXPIRY_SWEEP_INTERVAL_MS: ${EXPIRY_SWEEP_INTERVAL_MS:-3000}
     depends_on:
       postgres:
         condition: service_healthy

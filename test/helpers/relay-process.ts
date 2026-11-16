@@ -1,0 +1,20 @@
+import { connect } from "amqplib";
+import { createDatabasePool } from "../../src/scheduling/adapters/postgres/database.ts";
+import { postgresOutbox } from "../../src/scheduling/adapters/postgres/outbox.ts";
+import { assertTopology, publishConfirmed } from "../../src/scheduling/adapters/rabbitmq/messaging.ts";
+
+const pool = createDatabasePool(process.env.DATABASE_URL!);
+const outbox = postgresOutbox(pool);
+const connection = await connect(process.env.RABBITMQ_URL!);
+connection.on("error", () => {});
+const channel = await connection.createConfirmChannel();
+await assertTopology(channel);
+const delivery = (await outbox.ready()).find((delivery) => delivery.publicationId === process.env.PUBLICATION_ID);
+if (!delivery) throw new Error("Expected pending test publication");
+await publishConfirmed(channel, "appointments.work", delivery.consumer, delivery);
+process.send?.({ phase: "accepted", delivery });
+if (process.env.PAUSE_AFTER_CONFIRM === "true") await new Promise<void>((resolve) => process.once("message", () => resolve()));
+await outbox.published(delivery.publicationId);
+process.send?.({ phase: "recorded" });
+await channel.close(); await connection.close(); await pool.end();
+process.disconnect?.();

@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS scheduling.reservations (
     slot_id text NOT NULL REFERENCES scheduling.slots(id),
     patient_id text NOT NULL REFERENCES scheduling.patients(id),
     state text NOT NULL CHECK (state IN ('HELD', 'OFFERED', 'CONFIRMED', 'CANCELLED', 'EXPIRED')),
+    waiting_list_entry_id uuid REFERENCES scheduling.waiting_list_entries(id),
     created_at timestamptz NOT NULL,
     expires_at timestamptz NOT NULL,
     CHECK (created_at < expires_at),
@@ -87,6 +88,9 @@ CREATE TABLE IF NOT EXISTS scheduling.reservations (
 CREATE UNIQUE INDEX IF NOT EXISTS reservations_one_occupant_idx ON scheduling.reservations(slot_id)
     WHERE state IN ('HELD', 'OFFERED', 'CONFIRMED');
 CREATE INDEX IF NOT EXISTS reservations_patient_idx ON scheduling.reservations(patient_id);
+CREATE INDEX IF NOT EXISTS reservations_entry_idx ON scheduling.reservations(waiting_list_entry_id);
+CREATE UNIQUE INDEX IF NOT EXISTS reservations_one_offer_entry_idx ON scheduling.reservations(waiting_list_entry_id)
+    WHERE state = 'OFFERED';
 
 CREATE TABLE IF NOT EXISTS scheduling.http_creation_results (
     patient_id text NOT NULL REFERENCES scheduling.patients(id),
@@ -132,3 +136,34 @@ CREATE TABLE IF NOT EXISTS scheduling.outbox_publications (
 CREATE INDEX IF NOT EXISTS outbox_ready_idx ON scheduling.outbox_publications(available_at, created_at, id)
     WHERE published_at IS NULL;
 CREATE INDEX IF NOT EXISTS outbox_event_idx ON scheduling.outbox_publications(event_id);
+
+-- Terminal work is scoped to a logical consumer, independently of physical deliveries.
+CREATE TABLE IF NOT EXISTS scheduling.consumer_results (
+    event_id uuid NOT NULL REFERENCES scheduling.events(id),
+    consumer text NOT NULL,
+    current_cycle integer NOT NULL DEFAULT 0 CHECK (current_cycle >= 0),
+    outcome text CHECK (outcome IN ('succeeded', 'discarded')),
+    completed_at timestamptz,
+    PRIMARY KEY (event_id, consumer),
+    CHECK ((outcome IS NULL) = (completed_at IS NULL))
+);
+CREATE TABLE IF NOT EXISTS scheduling.consumer_cycles (
+    event_id uuid NOT NULL,
+    consumer text NOT NULL,
+    cycle integer NOT NULL CHECK (cycle >= 0),
+    state text NOT NULL CHECK (state IN ('active', 'completed', 'parked')),
+    PRIMARY KEY (event_id, consumer, cycle),
+    FOREIGN KEY (event_id, consumer) REFERENCES scheduling.consumer_results(event_id, consumer)
+);
+CREATE TABLE IF NOT EXISTS scheduling.consumer_attempts (
+    event_id uuid NOT NULL,
+    consumer text NOT NULL,
+    cycle integer NOT NULL,
+    attempt integer NOT NULL CHECK (attempt BETWEEN 0 AND 3),
+    not_before timestamptz NOT NULL,
+    outcome text CHECK (outcome IN ('succeeded', 'discarded', 'failed')),
+    completed_at timestamptz,
+    PRIMARY KEY (event_id, consumer, cycle, attempt),
+    FOREIGN KEY (event_id, consumer, cycle) REFERENCES scheduling.consumer_cycles(event_id, consumer, cycle),
+    CHECK ((outcome IS NULL) = (completed_at IS NULL))
+);

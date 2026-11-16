@@ -28,11 +28,14 @@ export function readApiConfig(environment = process.env) {
 }
 
 export function readWorkerConfig(environment = process.env) {
+  if (environment.RELAY_ENABLED !== undefined && !["true", "false"].includes(environment.RELAY_ENABLED)) throw new Error("RELAY_ENABLED must be true or false");
   return {
     databaseUrl: required(environment, "DATABASE_URL"),
     rabbitmqUrl: required(environment, "RABBITMQ_URL"),
     host: environment.HOST ?? "127.0.0.1",
     healthPort: port(environment, "WORKER_HEALTH_PORT", 3001),
     expirySweepIntervalMs: duration(environment, "EXPIRY_SWEEP_INTERVAL_MS", 3000),
+    offerMaximumMs: duration(environment, "OFFER_MAXIMUM_MS", 7_200_000),
+    relayEnabled: environment.RELAY_ENABLED === "true",
   };
 }

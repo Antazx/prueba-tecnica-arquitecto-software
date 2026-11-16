@@ -5,8 +5,9 @@ Esta entrega permite consultar una agenda sintética validada, bloquear un hueco
 con exclusividad, confirmar o cancelar la reserva y caducar los bloqueos desde
 el worker. Cada liberación conserva su evento y publicación pendiente en
 PostgreSQL. También permite alta, consulta y retirada de espera sin oferta,
-con FIFO persistido y prioridad frente a reserva directa. El transporte asíncrono,
-la adjudicación de ofertas y los avisos corresponden a las siguientes entregas.
+con FIFO persistido y prioridad frente a reserva directa. La outbox y RabbitMQ
+conectan la revisión del ámbito, las ofertas exclusivas y su aviso estructurado.
+Aceptar una oferta vigente confirma esa misma reserva y cierra la inscripción.
 
 ## Diseño funcional acordado
 
@@ -86,7 +87,8 @@ admisión real sin liberación que cubra su activación guardará
 Q17 conserva un límite físico finito en RabbitMQ y exige traslado seguro a DLQ
 mediante `at-least-once`, `reject-publish` y DLX configurado. El presupuesto lógico
 de PostgreSQL se mantiene separado; ambos motivos de aparcado serán recuperables.
-La configuración y sus pruebas son trabajo pendiente, sin otra tecnología.
+La topología versionada y su configuración efectiva se comprueban con servicios
+reales. Los reintentos lógicos y la recuperación manual se entregarán por separado.
 
 Q21 conserva los registros técnicos durante toda la vida de la demo, sin purgas
 automáticas. Q22 hace prevalecer la caducidad al intentar cancelar un bloqueo
@@ -109,8 +111,9 @@ replays e inscripción existente y la convivencia permitida. AC65–AC67 cubren
 Q25–Q26; AC68–AC69 hacen visibles límites ya aceptados de Q24 y del aviso.
 Están implementados la consulta de agenda, los bloqueos, su consulta propia,
 confirmación, cancelación y barrido de bloqueos vencidos con outbox, además del
-alta/consulta/retirada de espera sin oferta y su prioridad. Las ofertas y la
-publicación/consumo de mensajería siguen pendientes.
+alta/consulta/retirada de espera sin oferta y su prioridad, adjudicación asíncrona,
+aviso y aceptación. Rechazo, retirada con oferta, barrido de ofertas, reinscripción
+completa y recuperación de mensajería siguen pendientes.
 
 ## Arranque con un comando
 
@@ -205,7 +208,8 @@ GET añade `evaluatedAt`, `temporal.expired`, `temporal.closurePending` y `actio
 Si un temporal ha vencido, informa cierre pendiente y deshabilita las acciones,
 sin modificar filas. Una confirmada no vence por su antiguo plazo. Las acciones
 describen permisos funcionales de Q26. Confirmar y cancelar vuelven a validar
-estado y tiempo; las operaciones de oferta se incorporarán en otra entrega.
+estado y tiempo. Una oferta se acepta mediante el mismo endpoint de confirmación;
+su rechazo y la retirada con oferta se incorporarán después.
 
 Cabecera ausente o inválida, paciente inexistente, clave ausente o cuerpo dan
 `400`; recurso inexistente o ajeno da el mismo `404 NOT_FOUND`. El POST responde
@@ -270,17 +274,15 @@ de cierre por reserva protege una única liberación lógica. El evento contiene
 ámbito, hueco, reserva y causa, sin datos clínicos. El ID de publicación es
 distinto del ID del evento; consumidor lógico (`allocation`), ciclo e intento
 iniciales se conservan como referencias separadas para las siguientes entregas.
-Las tablas se retienen sin purgas. La publicación no está conectada todavía:
-RabbitMQ inaccesible no impide guardar negocio y outbox, pero aún no hay revisión
-de lista ni avisos a través del broker.
+Las tablas se retienen sin purgas. RabbitMQ inaccesible no impide guardar negocio
+y outbox; el relay recupera las publicaciones pendientes al conectar de nuevo.
 
 Para acortar una demostración local puede configurarse `DIRECT_HOLD_TTL_MS` en la
 API, entre 1 y 600000 ms (predeterminado 600000). Nunca amplía el plazo de diez
 minutos y siempre se limita al inicio. `EXPIRY_SWEEP_INTERVAL_MS` configura el
 intervalo del worker, positivo y predeterminado 3000 ms. En ejecución con Node,
-estas variables pueden añadirse al `.env` local; Compose conserva los valores
-predeterminados. No se promete todavía el recorrido completo ni la prioridad
-de lista del ticket siguiente.
+estas variables pueden añadirse al `.env` local o pasarse a Compose. El barrido
+de ofertas y la reinscripción completa se incorporan en la entrega #10.
 
 ## Disponibilidad y recuperación
 
@@ -302,8 +304,8 @@ recuperarse. Ambos procesos cierran sus recursos al recibir `SIGINT` o `SIGTERM`
 docker compose logs --follow api worker
 ```
 
-El worker todavía no publica ni consume trabajos de outbox. Ya ejecuta el barrido
-de bloqueos directos y conserva las conexiones y su estado de disponibilidad.
+El worker combina el barrido de bloqueos, dos consumidores y, cuando está
+habilitado, el relay. El barrido de bloqueos sigue funcionando sin broker.
 
 ## Alta, consulta y retirada de espera
 
@@ -356,10 +358,14 @@ nuevos. Repetir una clave exitosa sigue devolviendo su representación históric
 GET devuelve el estado actual. Una clave exitosa reutilizada para otro ámbito da
 `409 IDEMPOTENCY_KEY_REUSED`; las claves se separan por paciente y operación.
 
-Esta entrega no crea ofertas ni consume las activaciones. La asociación de oferta,
-su aceptación/rechazo, retirada con oferta y normalización de ofertas vencidas
-completan Q2/Q23/Q26 y los criterios compartidos en las entregas #8–#10. Los estados
-preparados para ofertas y las exclusiones no acreditan esos recorridos todavía.
+GET de una inscripción ofrecida incluye `offer` con la reserva y su vencimiento,
+`temporal` y acciones `canAcceptOffer`, `canRejectOffer`, `canWithdraw`. En la igualdad
+con el vencimiento muestra `OFFERED` persistido y cierre pendiente, con las acciones
+deshabilitadas, sin escribir. Una clave nueva devuelve una activa vigente con
+`200`, incluida su oferta, aunque haya un bloqueo propio permitido en otro hueco.
+Un replay histórico conserva su cuerpo/código iniciales. La normalización de
+ofertas vencidas en nuevas altas y la reinscripción completa son parte de #10;
+la retirada con oferta y su rechazo son parte de #9.
 
 ## Desarrollo local
 
@@ -392,7 +398,7 @@ pnpm dev:api
 En otra terminal, desde el mismo directorio y con la versión de Node seleccionada:
 
 ```bash
-pnpm dev:worker
+RELAY_ENABLED=true pnpm dev:worker
 ```
 
 Los dos comandos observan los cambios y ejecutan TypeScript mediante el soporte
@@ -409,12 +415,18 @@ Las pruebas de integración requieren una base de pruebas aislada, nunca una bas
 con datos que se deban conservar. Un ejemplo con un proyecto y puerto propios:
 
 ```bash
-POSTGRES_PORT=55434 docker compose -p agenda-tests up --wait postgres
-TEST_DATABASE_URL=postgresql://diagnostic:diagnostic_dev@127.0.0.1:55434/diagnostic_appointments pnpm test:integration
+POSTGRES_PORT=55434 RABBITMQ_PORT=5684 docker compose -p agenda-tests up --wait postgres rabbitmq
+COMPOSE_PROJECT_NAME=agenda-tests node scripts/verify-rabbitmq.mjs
+TEST_DATABASE_URL=postgresql://diagnostic:diagnostic_dev@127.0.0.1:55434/diagnostic_appointments TEST_RABBITMQ_URL=amqp://diagnostic:diagnostic_dev@127.0.0.1:5684 pnpm test:integration
 ```
 
 `pnpm test` ejecuta las reglas puras; `pnpm test:integration` comprueba el contrato
-HTTP con Fastify `inject` y PostgreSQL real. Las consultas se comprueban también
+HTTP con Fastify `inject`, PostgreSQL y RabbitMQ reales. La E2E arranca dos APIs
+y dos workers, usa HTTP de red y crea una base sintética por ejecución; requiere
+que el usuario de pruebas pueda crear bases. Estas bases se conservan como
+artefactos locales. La CI arranca los servicios con Compose después del checkout
+para montar las definiciones versionadas del broker y comprobarlas antes de probar.
+Las consultas se comprueban también
 con una conexión de solo lectura. La concurrencia arranca dos procesos Node con
 pools propios y usa una conexión controladora que retiene el ámbito; un observador
 verifica esperas reales y sus cadenas con `pg_stat_activity`/`pg_blocking_pids`
@@ -535,7 +547,7 @@ src/
     └── adapters/
         ├── http/                  Contrato HTTP e identidad sintética
         ├── postgres/              Coordinación, persistencia y reloj autoritativo
-        └── rabbitmq/              Conexión AMQP
+        └── rabbitmq/              Topología, publicación confirmada y consumo AMQP
 ```
 
 Las reglas no importan HTTP, SQL ni AMQP. Los casos de uso acceden a un único
@@ -545,29 +557,92 @@ no coordinaría instancias, y repositorios CRUD genéricos, que ocultarían la
 atomicidad necesaria. Los bloqueos pesimistas del ámbito simplifican este
 ejercicio frente a detectar conflictos de varias escrituras al final.
 
+## Ofertas y mensajería implementadas
+
+El relay del worker publica una sola fila a la vez con mensajes persistentes,
+`mandatory` y confirmación del broker. Una devolución sin ruta es fallo aunque
+haya confirm positivo; el booleano de `publish` solo regula contrapresión.
+`published_at` acredita publicación confirmada con ruta, no consumo ni aviso.
+Una caída tras aceptación del broker y antes de guardar esa fecha puede duplicar.
+
+Cada entrega lleva versión, evento, consumidor lógico, ciclo, intento y publicación
+separados. El consumidor coordina la pareja evento/consumidor en PostgreSQL antes
+del ámbito. Guarda efectos, resultado por ciclo/intento y siguientes eventos en
+un mismo commit, y solo entonces hace ack manual. El resultado terminal protege
+frente a publicaciones/reentregas repetidas y a intentos antiguos. No ordena por
+la llegada al broker: una revisión adquiere el ámbito, relee estado/tiempo, cierra
+los temporales pertinentes y recorre todos los huecos libres futuros por inicio/ID.
+Cada hueco obtiene la primera inscripción elegible FIFO; avanza tras exclusiones
+o ausencia de candidato, aunque el origen esté reocupado o iniciado. No toca una
+reserva sustituta ni usa matching global o cursores.
+
+La oferta `OFFERED`, su vínculo a la inscripción y `OfferCreated` con outbox se
+comprometen juntos. Dos índices parciales garantizan un ocupante por hueco y una
+oferta por inscripción. Su plazo es `min(creación + OFFER_MAXIMUM_MS, inicio)`,
+con máximo configurable positivo y dos horas por defecto. Confirmarla por
+`POST /reservations/ID/confirm` conserva ID y cierra la inscripción con `ACCEPTED`;
+una aceptación tardía cierra por caducidad, libera y devuelve conflicto.
+
+El aviso relee la reserva concreta inmediatamente antes de escribir. Solo emite
+si aún es `OFFERED` vigente; omite una reserva confirmada/cancelada/vencida y nunca
+busca una sustituta. El log JSON contiene `eventId`, `reservationId`, `slotId`,
+referencia sintética `patientId` y `expiresAt` persistido. Espera el callback de
+escritura o su error antes del resultado SQL y del ack, sin bloquear el ámbito.
+Puede repetirse tras una caída entre escribir y registrar, o aparecer tarde si
+vence después de comprobarla. No acredita recepción humana, vigencia al leerlo
+ni captura durable por la plataforma. Aceptar siempre revalida.
+
+`rabbitmq/definitions.json` y `rabbitmq/rabbitmq.conf` aprovisionan desde vacío
+usuario/credencial ficticios, exchanges, bindings y cuatro colas quorum durables:
+`appointments.allocation`, `appointments.notifications` y sus dos `.dlq`. Las
+principales tienen `delivery-limit=20`, DLX `at-least-once`, rutas específicas y
+`overflow=reject-publish`. Las DLQ desactivan su propio límite físico, usan
+`reject-publish` y no tienen TTL, DLX ni retorno automático. El verificador lee
+argumentos, política efectiva, bindings, operator policies y flags reales.
+En RabbitMQ 4.4, `basic.reject(requeue=true)` incrementa fallos físicos; se observan
+contadores 0…20 y el siguiente fallo supera el límite. No equivale a veinte
+adquisiciones totales ni al futuro presupuesto lógico de cuatro intentos.
+
+Compose arranca un solo worker con `RELAY_ENABLED=true` por defecto. En ejecución
+Node el valor predeterminado es `false`; habilitarlo explícitamente en W1 y dejar
+`false` en W2 y demás réplicas. Todos consumen con ack manual y `prefetch=1` por
+consumidor. W2 no publica ni sustituye al relay caído; un miembro local quorum y
+un relay configurado no aportan alta disponibilidad. Para proyectos paralelos,
+usar puertos/volúmenes distintos y `APPLICATION_IMAGE=appointment-task:local`,
+que evita compartir la etiqueta de imagen entre builds de tareas distintas.
+
+El recorrido reproducible automatizado está en `async-offers-e2e.test.ts`: consultar
+el único H de south/mri → Carlos bloquea → Ana/Bruno esperan por orden mientras
+R1 sigue vigente → W2 barre sin publicar → W1 publica → observar aviso real →
+Ana acepta R2. Verifica R1 `EXPIRED`, solo R2 `CONFIRMED` y Bruno `WAITING`.
+Después cancela la cita confirmada y observa oferta/aceptación de Bruno. Las
+pruebas adicionales usan dos procesos consumidores con barreras SQL, caída entre
+commit/ack, devolución mandatory real, desorden, exclusiones, rollback y fallos
+de escritura. Para el recorrido manual puede reducirse `DIRECT_HOLD_TTL_MS` en
+Compose y seguir `docker compose logs --follow worker` para obtener la oferta;
+los GET propios y el endpoint de confirmación completan la aceptación.
+
 ## Alcance pendiente
 
-- Adjudicación, aceptación/rechazo de ofertas, retirada con oferta y caducidad de
-  ofertas/reinscripción; completar sus criterios compartidos con el alta actual.
-- Relay de la outbox, consumidores idempotentes, avisos asíncronos, reintentos y DLQ.
-  Negocio y trabajo durable ya se guardan atómicamente en PostgreSQL.
-- Ampliar las suites y CI al entregar las siguientes funcionalidades. Herramientas
-  adicionales de lint/formato siguen siendo propuestas.
+- Rechazo de ofertas y retirada con oferta (#9); barrido de ofertas y normalización
+  completa de nuevas altas/reinscripciones (#10).
+- Recuperación del relay con fechas/errores durables y progreso entre rutas rotas
+  (#11). En esta entrega un fallo deja pendiente y reconecta, pero puede retrasar
+  otras publicaciones; no se atribuye ya AC35 completo.
+- Presupuesto lógico, backoff SQL, aparcado de fallos y recuperación manual
+  (#12–#13). Hasta entonces un fallo revierte negocio y conserva la entrega,
+  espera un segundo antes de rechazar/reencolar cada fallo y usa la protección
+  del broker;
+  todavía no acredita las garantías de reintento lógico/outage de la spec.
+- Prueba de retención DLX con destino indisponible y recuperación de ambos caminos
+  de DLQ, correspondientes a las entregas de recuperación. No hay purgas automáticas.
+- Consolidación final de documentación y cobertura compartida (#14).
 
-## Mensajería: garantías previstas
-
-La comprobación técnica actual usa confirmaciones del publicador y acuse del
-mensaje recibido, en una cola efímera. Todavía no hay garantías de entrega de
-eventos de citación implementadas.
-
-La estrategia acordada para la siguiente fase funcional es entrega al menos una
-vez: cambio de negocio y evento pendiente ya se guardan en una misma transacción;
-el futuro publicador recuperará pendientes y confirmará su publicación. Una caída entre
-publicar y registrar el envío puede producir duplicados. El consumidor deduplicará
-el mensaje y aplicará su efecto en una misma transacción antes de reconocerlo.
-La validez de cada transición deberá comprobarse para gestionar mensajes que lleguen
-desordenados. Estos comportamientos necesitarán pruebas con PostgreSQL y RabbitMQ
-reales cuando se implementen.
+Los volúmenes y el nombre de nodo conservan estado en reinicios normales. Este
+esquema versionado está destinado al arranque sintético desde vacío; no migra una
+base poblada de una entrega anterior. Conservar una configuración incompatible
+debe diagnosticarse, sin borrar colas/volúmenes automáticamente. La retención no
+es backup y no garantiza recuperación tras pérdida irreversible de los discos.
 
 ## Datos de pacientes en un entorno real
 

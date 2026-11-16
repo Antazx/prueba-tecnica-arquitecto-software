@@ -1,12 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { decideAdmission, hasActiveDirectHold, decideWaitingWithdrawal, waitingListHasPriority } from "../domain/waiting-list.ts";
 import { evaluateReservation } from "../domain/reservation.ts";
+import { evaluateEntryOffer } from "../domain/offers.ts";
 import type { Reservation, Scheduling, SchedulingTransaction } from "./scheduling.ts";
+import { representReservation as represent } from "./reservation-representation.ts";
 
 export interface WaitingListScope { hospitalId: string; testTypeId: string }
 export interface WaitingListEntry extends WaitingListScope {
   id: string; patientId: string; admissionOrder: string; state: "WAITING" | "OFFERED" | "CLOSED";
   closureReason?: "ACCEPTED" | "EXPIRED" | "WITHDRAWN"; createdAt: number; excludedSlotIds: string[];
+  offer?: Reservation;
 }
 export interface AdmissionState {
   entries: WaitingListEntry[]; reservations: Reservation[];
@@ -14,12 +17,14 @@ export interface AdmissionState {
 }
 export interface WaitingListRepresentation extends WaitingListScope {
   id: string; admissionOrder: string; state: WaitingListEntry["state"]; closureReason?: WaitingListEntry["closureReason"]; createdAt: string; excludedSlotIds: string[];
+  offer?: ReturnType<typeof represent>;
 }
 
 export function representEntry(entry: WaitingListEntry): WaitingListRepresentation {
   return { id: entry.id, hospitalId: entry.hospitalId, testTypeId: entry.testTypeId,
     admissionOrder: entry.admissionOrder, state: entry.state, closureReason: entry.closureReason,
-    createdAt: new Date(entry.createdAt).toISOString(), excludedSlotIds: entry.excludedSlotIds };
+    createdAt: new Date(entry.createdAt).toISOString(), excludedSlotIds: entry.excludedSlotIds,
+    ...(entry.offer ? { offer: represent(entry.offer) } : {}) };
 }
 
 async function expireAdmissionHolds(transaction: SchedulingTransaction, state: AdmissionState, time: number, pertinent: (reservation: Reservation) => boolean) {
@@ -41,7 +46,7 @@ export function waitingListUseCases(scheduling: Scheduling) {
       const snapshot = await scheduling.readOwnWaitingListEntry(patientId, entryId);
       if (!snapshot) return { status: 404, body: { code: "NOT_FOUND" } };
       return { status: 200, body: { ...representEntry(snapshot.entry), evaluatedAt: new Date(snapshot.evaluatedAt).toISOString(),
-        temporal: { expired: false, closurePending: false }, actions: { canWithdraw: snapshot.entry.state !== "CLOSED" } } };
+        ...evaluateEntryOffer(snapshot.entry.state, snapshot.entry.offer, snapshot.evaluatedAt) } };
     },
     async withdrawWaitingListEntry(patientId: string, entryId: string) {
       return scheduling.transaction(async (transaction) => {
@@ -68,6 +73,7 @@ export function waitingListUseCases(scheduling: Scheduling) {
         let released = await expireAdmissionHolds(transaction, state, createdAt, (reservation) => reservation.patientId === patientId);
         const active = state.entries.find((entry) => entry.patientId === patientId);
         if (active) {
+          active.offer = state.reservations.find((reservation) => reservation.waitingListEntryId === active.id && reservation.state === "OFFERED");
           const body = representEntry(active);
           await transaction.saveCreationResult(identity, { fingerprint, status: 200, body });
           return { status: 200, body };
