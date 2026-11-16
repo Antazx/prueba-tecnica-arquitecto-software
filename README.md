@@ -2,7 +2,7 @@
 
 Implementación de la [prueba de arquitectura de software](docs/diagnostic-appointment-requirements.pdf).
 Esta entrega permite consultar una agenda sintética validada, bloquear un hueco
-con exclusividad, confirmar o cancelar la reserva y caducar los bloqueos desde
+con exclusividad, confirmar o cancelar la reserva y caducar los temporales desde
 el worker. Cada liberación conserva su evento y publicación pendiente en
 PostgreSQL. También permite alta, consulta y retirada de espera sin oferta,
 con FIFO persistido y prioridad frente a reserva directa. La outbox y RabbitMQ
@@ -112,8 +112,8 @@ Q25–Q26; AC68–AC69 hacen visibles límites ya aceptados de Q24 y del aviso.
 Están implementados la consulta de agenda, los bloqueos, su consulta propia,
 confirmación, cancelación y barrido de bloqueos vencidos con outbox, además del
 alta/consulta/retirada de espera sin oferta y su prioridad, adjudicación asíncrona,
-aviso y aceptación. Rechazo, retirada con oferta, barrido de ofertas, reinscripción
-completa y recuperación de mensajería siguen pendientes.
+aviso, aceptación, barrido de ofertas y reinscripción independiente del barrido.
+Rechazo, retirada con oferta y recuperación de mensajería siguen pendientes.
 
 ## Arranque con un comando
 
@@ -262,8 +262,8 @@ obtenido tras esperar los bloqueos; no se usa el inicio de la transacción para
 conceder vigencia adicional.
 
 El worker inicializa esquema/seed con la misma coordinación que la API antes de
-barrer. Busca hasta 100 bloqueos vencidos por pasada, ordenados por vencimiento
-e ID, y revalida cada uno bajo el mismo protocolo de ámbito, hueco y reserva.
+barrer. Busca hasta 100 reservas `HELD`/`OFFERED` vencidas por pasada, ordenadas
+por vencimiento e ID, y revalida cada una bajo el mismo protocolo de ámbito, hueco y reserva.
 Recupera atrasos aunque el hueco ya haya empezado; una confirmada no caduca por
 su viejo TTL. El intervalo predeterminado es tres segundos; no acredita un plazo
 máximo de liberación.
@@ -281,8 +281,11 @@ Para acortar una demostración local puede configurarse `DIRECT_HOLD_TTL_MS` en 
 API, entre 1 y 600000 ms (predeterminado 600000). Nunca amplía el plazo de diez
 minutos y siempre se limita al inicio. `EXPIRY_SWEEP_INTERVAL_MS` configura el
 intervalo del worker, positivo y predeterminado 3000 ms. En ejecución con Node,
-estas variables pueden añadirse al `.env` local o pasarse a Compose. El barrido
-de ofertas y la reinscripción completa se incorporan en la entrega #10.
+estas variables pueden añadirse al `.env` local o pasarse a Compose. El mismo
+barrido caduca ofertas y cierra su inscripción con causa `EXPIRED`.
+La liberación activa la revisión asíncrona; solo un hueco todavía futuro puede
+ofrecerse al siguiente elegible. Una cita confirmada no vence por su antiguo TTL
+y una inscripción sin oferta no caduca porque empiece un hueco.
 
 ## Disponibilidad y recuperación
 
@@ -304,8 +307,8 @@ recuperarse. Ambos procesos cierran sus recursos al recibir `SIGINT` o `SIGTERM`
 docker compose logs --follow api worker
 ```
 
-El worker combina el barrido de bloqueos, dos consumidores y, cuando está
-habilitado, el relay. El barrido de bloqueos sigue funcionando sin broker.
+El worker combina el barrido de temporales, dos consumidores y, cuando está
+habilitado, el relay. El barrido de temporales sigue funcionando sin broker.
 
 ## Alta, consulta y retirada de espera
 
@@ -363,9 +366,16 @@ GET de una inscripción ofrecida incluye `offer` con la reserva y su vencimiento
 con el vencimiento muestra `OFFERED` persistido y cierre pendiente, con las acciones
 deshabilitadas, sin escribir. Una clave nueva devuelve una activa vigente con
 `200`, incluida su oferta, aunque haya un bloqueo propio permitido en otro hueco.
-Un replay histórico conserva su cuerpo/código iniciales. La normalización de
-ofertas vencidas en nuevas altas y la reinscripción completa son parte de #10;
-la retirada con oferta y su rechazo son parte de #9.
+Un replay histórico conserva su cuerpo/código iniciales. Con una clave nueva,
+una oferta propia vencida cierra la reserva y su inscripción antes de decidir
+la nueva intención, aunque el barrido esté detenido. También caducan los bloqueos
+propios vencidos de huecos ya iniciados y los demás temporales vencidos de huecos
+futuros pertinentes. Solo después se devuelve una activa real o se aplica Q24
+antes de Q2. Si procede, I2 obtiene identidad nueva y va al final; un `409` conserva
+los cierres y su outbox sin registrar un alta exitosa. Todo revierte junto ante
+un fallo técnico. Una clave que ya obtuvo éxito sigue devolviendo su resultado
+original, incluso si la participación terminó. La retirada con oferta y su
+rechazo son parte de #9.
 
 ## Desarrollo local
 
@@ -622,10 +632,25 @@ de escritura. Para el recorrido manual puede reducirse `DIRECT_HOLD_TTL_MS` en
 Compose y seguir `docker compose logs --follow worker` para obtener la oferta;
 los GET propios y el endpoint de confirmación completan la aceptación.
 
+La prueba `offer-expiry-e2e.test.ts` retrasa el trabajo de aviso de Ana en
+la outbox de una base sintética, sin cambiar la creación normal de ofertas.
+El worker cierra su oferta al vencer, el consumidor descarta después el aviso
+antiguo y la aceptación por HTTP devuelve conflicto. Con hueco futuro, Bruno
+recibe un aviso realmente escrito y acepta su propia reserva; si el vencimiento
+coincide con el inicio, permanece esperando. El plazo nace al crear la oferta:
+puede vencer sin un aviso utilizable y eso no acredita recepción, desinterés ni
+una ventana efectiva para responder. En un entorno real habría que acordar esa
+política con el hospital.
+
+Las pruebas de reinscripción mantienen separados los casos con prioridad ajena,
+capacidad directa y bloqueo propio vigente, con barrido detenido o ya ejecutado.
+Comprueban claves históricas y nuevas, GET con conexión de solo lectura, un fallo
+diferido al commit y dos APIs que cruzan el vencimiento mientras esperan
+coordinación; no atribuyen el reloj de PostgreSQL a temporizadores JavaScript.
+
 ## Alcance pendiente
 
-- Rechazo de ofertas y retirada con oferta (#9); barrido de ofertas y normalización
-  completa de nuevas altas/reinscripciones (#10).
+- Rechazo de ofertas y retirada con oferta (#9).
 - Recuperación del relay con fechas/errores durables y progreso entre rutas rotas
   (#11). En esta entrega un fallo deja pendiente y reconecta, pero puede retrasar
   otras publicaciones; no se atribuye ya AC35 completo.

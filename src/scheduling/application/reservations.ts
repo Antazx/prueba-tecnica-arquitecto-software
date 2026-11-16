@@ -64,16 +64,17 @@ export function schedulingUseCases(scheduling: Scheduling, options: { holdTtlMs?
         return { status: decision.allowed ? 200 : 409, body: decision.allowed ? body : { ...body, code: decision.code } };
       });
     },
-    async expireDirectHolds() {
+    async expireTemporaryReservations() {
       let expiredCount = 0;
-      for (const candidate of await scheduling.dueDirectHolds()) {
+      for (const candidate of await scheduling.dueTemporaryReservations()) {
         const expired = await scheduling.transaction(async (transaction) => {
           const reservation = await transaction.lockOwnReservation(candidate.patientId, candidate.id);
-          if (!reservation || reservation.state !== "HELD") return false;
+          if (!reservation || !["HELD", "OFFERED"].includes(reservation.state)) return false;
           const evaluatedAt = await transaction.currentTime();
           if (!evaluateReservation(reservation, evaluatedAt).expired) return false;
           await transaction.setReservationState(reservation.id, "EXPIRED");
           await transaction.recordSlotRelease(reservation, "EXPIRED", evaluatedAt);
+          if (reservation.waitingListEntryId) await transaction.closeWaitingListEntry(reservation.waitingListEntryId, "EXPIRED");
           return true;
         });
         if (expired) expiredCount++;

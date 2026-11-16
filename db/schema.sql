@@ -104,7 +104,7 @@ CREATE TABLE IF NOT EXISTS scheduling.http_creation_results (
            (fingerprint IS NOT NULL AND status_code IS NOT NULL AND status_code IN (200, 201) AND response_body IS NOT NULL))
 );
 
-CREATE INDEX IF NOT EXISTS reservations_due_holds_idx ON scheduling.reservations(expires_at, id) WHERE state = 'HELD';
+CREATE INDEX IF NOT EXISTS reservations_due_temporaries_idx ON scheduling.reservations(expires_at, id) WHERE state IN ('HELD', 'OFFERED');
 
 -- A logical event survives every publication and delivery of that same work.
 CREATE TABLE IF NOT EXISTS scheduling.events (
