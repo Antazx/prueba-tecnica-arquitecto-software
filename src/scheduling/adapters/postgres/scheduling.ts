@@ -4,6 +4,7 @@ import type { Pool, PoolClient } from "pg";
 import type { CreationIdentity, CreationResult, Reservation, Scheduling, SchedulingTransaction } from "../../application/scheduling.ts";
 import { storageError } from "./errors.ts";
 import { messageOperations } from "./messages.ts";
+import { recoveryOperations } from "./recovery.ts";
 
 interface ReservationRow {
   id: string; slot_id: string; patient_id: string; state: Reservation["state"];
@@ -21,6 +22,7 @@ function transactionOperations(client: PoolClient): SchedulingTransaction {
   return {
     ...waitingListOperations(client),
     ...messageOperations(client),
+    ...recoveryOperations(client),
     patientExists: (patientId) => patientExists(client, patientId),
     async coordinateCreation(identity: CreationIdentity) {
       const key = [identity.patientId, identity.operation, identity.key];

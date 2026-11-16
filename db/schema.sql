@@ -158,7 +158,7 @@ CREATE TABLE IF NOT EXISTS scheduling.consumer_cycles (
     cycle integer NOT NULL CHECK (cycle >= 0),
     state text NOT NULL CHECK (state IN ('active', 'completed', 'parked')),
     parked_at timestamptz,
-    park_reason text CHECK (park_reason IN ('permanent', 'exhausted')),
+    park_reason text CHECK (park_reason IN ('permanent', 'exhausted', 'physical', 'operator')),
     PRIMARY KEY (event_id, consumer, cycle),
     FOREIGN KEY (event_id, consumer) REFERENCES scheduling.consumer_results(event_id, consumer)
 );
@@ -176,3 +176,25 @@ CREATE TABLE IF NOT EXISTS scheduling.consumer_attempts (
     FOREIGN KEY (event_id, consumer, cycle) REFERENCES scheduling.consumer_cycles(event_id, consumer, cycle),
     CHECK ((outcome IS NULL) = (completed_at IS NULL))
 );
+
+-- Explicit operator decisions survive DLQ acknowledgements and broker loss.
+CREATE TABLE IF NOT EXISTS scheduling.consumer_recoveries (
+    id uuid PRIMARY KEY,
+    event_id uuid NOT NULL,
+    consumer text NOT NULL,
+    source_cycle integer NOT NULL,
+    source_attempt integer NOT NULL CHECK (source_attempt BETWEEN 0 AND 3),
+    source_publication_id uuid NOT NULL UNIQUE REFERENCES scheduling.outbox_publications(id),
+    source text NOT NULL CHECK (source IN ('application_dlq', 'broker_dlq', 'persisted')),
+    operator text NOT NULL CHECK (length(trim(operator)) BETWEEN 1 AND 100),
+    reason text NOT NULL CHECK (length(trim(reason)) BETWEEN 1 AND 1000),
+    outcome text NOT NULL CHECK (outcome IN ('recovered', 'already_completed', 'superseded')),
+    new_cycle integer NOT NULL CHECK (new_cycle >= 0),
+    next_publication_id uuid REFERENCES scheduling.outbox_publications(id),
+    recorded_at timestamptz NOT NULL,
+    FOREIGN KEY (event_id,consumer,source_cycle) REFERENCES scheduling.consumer_cycles(event_id,consumer,cycle),
+    CHECK ((outcome = 'recovered') = (next_publication_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS recoveries_one_new_cycle_idx
+    ON scheduling.consumer_recoveries(event_id,consumer,source_cycle) WHERE outcome='recovered';
+CREATE INDEX IF NOT EXISTS recoveries_next_publication_idx ON scheduling.consumer_recoveries(next_publication_id);
