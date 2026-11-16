@@ -68,6 +68,13 @@ export function buildApi(checkPostgres: () => Promise<void>, readAgenda: AgendaR
       const result = await scheduling.confirmReservation(request.headers["x-patient-id"], request.params.id);
       return reply.code(result.status).send(result.body);
     });
+    api.post<{ Params: { id: string }; Headers: { "x-patient-id": string } }>("/reservations/:id/reject", {
+      schema: { params, headers: patientHeaders },
+    }, async (request, reply) => {
+      if (request.body !== undefined) return reply.code(400).send({ code: "BODY_NOT_ALLOWED" });
+      const result = await scheduling.rejectOffer(request.headers["x-patient-id"], request.params.id);
+      return reply.code(result.status).send(result.body);
+    });
     api.post<{ Params: { id: string }; Headers: { "x-patient-id": string } }>("/reservations/:id/cancel", {
       schema: { params, headers: patientHeaders },
     }, async (request, reply) => {

@@ -10,10 +10,15 @@ export function decideAdmission(state: { hasActiveEntry: boolean; hasOwnHold: bo
   return { kind: "admit" };
 }
 
-export function decideWaitingWithdrawal(entry: { state: "WAITING" | "OFFERED" | "CLOSED"; closureReason?: "ACCEPTED" | "EXPIRED" | "WITHDRAWN" }) {
-  if (entry.state === "CLOSED") return { allowed: true, state: entry.state, closureReason: entry.closureReason };
-  if (entry.state === "OFFERED") return { allowed: false, state: entry.state, closureReason: entry.closureReason };
-  return { allowed: true, state: "CLOSED" as const, closureReason: "WITHDRAWN" as const };
+export function decideWaitingWithdrawal(entry: { state: "WAITING" | "OFFERED" | "CLOSED"; closureReason?: "ACCEPTED" | "EXPIRED" | "WITHDRAWN" }, offer: { expiresAt: number } | undefined, time: number) {
+  if (entry.state === "CLOSED") return { state: entry.state, closureReason: entry.closureReason };
+  if (entry.state === "OFFERED") {
+    if (!offer) throw new Error("Offered entry must have an offer");
+    return Math.floor(time) >= Math.floor(offer.expiresAt)
+      ? { state: "CLOSED" as const, closureReason: "EXPIRED" as const, reservationState: "EXPIRED" as const }
+      : { state: "CLOSED" as const, closureReason: "WITHDRAWN" as const, reservationState: "CANCELLED" as const };
+  }
+  return { state: "CLOSED" as const, closureReason: "WITHDRAWN" as const };
 }
 
 export function waitingListHasPriority(entries: readonly { state: string; excludedSlotIds: readonly string[] }[], slotId: string): boolean {

@@ -58,10 +58,16 @@ export function waitingListUseCases(scheduling: Scheduling) {
         if (!await transaction.patientExists(patientId)) return { status: 400, body: { code: "UNKNOWN_PATIENT" } };
         const entry = await transaction.lockOwnWaitingListEntry(patientId, entryId);
         if (!entry) return { status: 404, body: { code: "NOT_FOUND" } };
-        const decision = decideWaitingWithdrawal(entry);
-        if (!decision.allowed) return { status: 409, body: { ...representEntry(entry), code: "ENTRY_HAS_OFFER" } };
-        if (decision.state !== entry.state) await transaction.closeWaitingListEntry(entry.id, "WITHDRAWN");
-        return { status: 200, body: representEntry({ ...entry, state: decision.state, closureReason: decision.closureReason }) };
+        const time = await transaction.currentTime();
+        const decision = decideWaitingWithdrawal(entry, entry.offer, time);
+        if (decision.state !== entry.state && decision.closureReason) {
+          if (entry.offer && decision.reservationState) {
+            await transaction.setReservationState(entry.offer.id, decision.reservationState);
+            await transaction.recordSlotRelease(entry.offer, decision.closureReason === "EXPIRED" ? "EXPIRED" : "WITHDRAWN", time);
+          }
+          await transaction.closeWaitingListEntry(entry.id, decision.closureReason);
+        }
+        return { status: 200, body: representEntry({ ...entry, offer: undefined, state: decision.state, closureReason: decision.closureReason }) };
       });
     },
     async joinWaitingList(patientId: string, scope: WaitingListScope, key: string) {
