@@ -38,6 +38,7 @@ export interface SchedulingTransaction {
   lockWaitingListScope(scope: WaitingListScope): Promise<boolean>;
   lockOwnWaitingListEntry(patientId: string, entryId: string): Promise<WaitingListEntry | null>;
   closeWaitingListEntry(entryId: string, reason: NonNullable<WaitingListEntry["closureReason"]>): Promise<void>;
+  returnEntryAfterRejection(entryId: string, slotId: string): Promise<void>;
   lockAdmissionState(scope: WaitingListScope): Promise<AdmissionState>;
   insertWaitingListEntry(id: string, patientId: string, scope: WaitingListScope, createdAt: number): Promise<WaitingListEntry>;
   recordAllocationReview(scope: WaitingListScope, entryId: string, occurredAt: number): Promise<void>;

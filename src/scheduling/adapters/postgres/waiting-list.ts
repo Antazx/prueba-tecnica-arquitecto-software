@@ -14,7 +14,7 @@ function entryFromRow(row: EntryRow): WaitingListEntry {
 }
 
 export function waitingListOperations(client: PoolClient): Pick<SchedulingTransaction,
-  "lockWaitingListScope" | "lockAdmissionState" | "lockOwnWaitingListEntry" | "closeWaitingListEntry" | "insertWaitingListEntry" | "recordAllocationReview"> {
+  "lockWaitingListScope" | "lockAdmissionState" | "lockOwnWaitingListEntry" | "closeWaitingListEntry" | "returnEntryAfterRejection" | "insertWaitingListEntry" | "recordAllocationReview"> {
   return {
     async lockWaitingListScope(scope) {
       const result = await client.query(`SELECT hospital_id FROM scheduling.waiting_list_scopes
@@ -27,11 +27,26 @@ export function waitingListOperations(client: PoolClient): Pick<SchedulingTransa
       const target = discovery.rows[0];
       if (!target) return null;
       await client.query(`SELECT hospital_id FROM scheduling.waiting_list_scopes WHERE hospital_id=$1 AND test_type_id=$2 FOR UPDATE`, [target.hospital_id, target.test_type_id]);
+      // Scope first, then slot/reservation, then entry, as with confirmation and allocation.
+      await client.query(`SELECT s.id FROM scheduling.slots s JOIN scheduling.reservations r ON r.slot_id=s.id
+        WHERE r.waiting_list_entry_id=$1 AND r.state='OFFERED' ORDER BY s.id FOR UPDATE OF s`, [entryId]);
+      const offers = await client.query<{ id: string; slot_id: string; created_at: Date; expires_at: Date; starts_at: Date; ends_at: Date }>(`
+        SELECT r.*,s.starts_at,s.ends_at FROM scheduling.reservations r JOIN scheduling.slots s ON s.id=r.slot_id
+        WHERE r.waiting_list_entry_id=$1 AND r.state='OFFERED' ORDER BY r.slot_id,r.id FOR UPDATE OF r`, [entryId]);
       const result = await client.query<EntryRow>(`SELECT e.*, ARRAY(SELECT x.slot_id FROM scheduling.waiting_list_slot_exclusions x WHERE x.entry_id=e.id ORDER BY x.slot_id) AS excluded_slot_ids FROM scheduling.waiting_list_entries e WHERE id=$1 AND patient_id=$2 FOR UPDATE OF e`, [entryId, patientId]);
-      return result.rows[0] ? entryFromRow(result.rows[0]) : null;
+      if (!result.rows[0]) return null;
+      const entry = entryFromRow(result.rows[0]);
+      const offer = offers.rows[0];
+      if (offer) entry.offer = { id: offer.id, slotId: offer.slot_id, patientId, waitingListEntryId: entry.id, state: "OFFERED",
+        createdAt: offer.created_at.getTime(), expiresAt: offer.expires_at.getTime(), startsAt: offer.starts_at.getTime(), endsAt: offer.ends_at.getTime() };
+      return entry;
     },
     async closeWaitingListEntry(entryId, reason) {
       await client.query("UPDATE scheduling.waiting_list_entries SET state='CLOSED', closure_reason=$2 WHERE id=$1", [entryId, reason]);
+    },
+    async returnEntryAfterRejection(entryId, slotId) {
+      await client.query("UPDATE scheduling.waiting_list_entries SET state='WAITING' WHERE id=$1", [entryId]);
+      await client.query("INSERT INTO scheduling.waiting_list_slot_exclusions(entry_id,slot_id) VALUES ($1,$2)", [entryId, slotId]);
     },
     async lockAdmissionState(scope) {
       const key = [scope.hospitalId, scope.testTypeId];
