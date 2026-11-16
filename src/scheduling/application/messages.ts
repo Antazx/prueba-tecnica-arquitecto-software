@@ -4,6 +4,7 @@ import { evaluateReservation } from "../domain/reservation.ts";
 import type { Scheduling } from "./scheduling.ts";
 import { DependencyUnavailable } from "./scheduling.ts";
 import { planFailure } from "../domain/message-retries.ts";
+import { expireReservation } from "./reservation-expiry.ts";
 
 export interface Delivery {
   version: 1; publicationId: string; eventId: string; consumer: "allocation" | "notification"; cycle: number; attempt: number;
@@ -51,11 +52,9 @@ export function messageUseCases(scheduling: Scheduling, writeNotification: Notif
           if (!evaluateReservation(reservation, time).expired) continue;
           // Include started offers: their entry cannot remain indefinitely occupied.
           if (reservation.startsAt <= time && reservation.state !== "OFFERED") continue;
-          await transaction.setReservationState(reservation.id, "EXPIRED");
-          await transaction.recordSlotRelease(reservation, "EXPIRED", time);
+          await expireReservation(transaction, reservation, time);
           reservation.state = "EXPIRED";
           if (reservation.waitingListEntryId) {
-            await transaction.closeWaitingListEntry(reservation.waitingListEntryId, "EXPIRED");
             const entry = state.entries.find((entry) => entry.id === reservation.waitingListEntryId);
             if (entry) entry.state = "CLOSED";
           }

@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { decideDirectHold, evaluateReservation, decideConfirmation, decideCancellation } from "../domain/reservation.ts";
 import type { Reservation, Scheduling } from "./scheduling.ts";
 import { representReservation as represent } from "./reservation-representation.ts";
+import { expireReservation } from "./reservation-expiry.ts";
 
 export function schedulingUseCases(scheduling: Scheduling, options: { holdTtlMs?: number } = {}) {
   return {
@@ -42,10 +43,11 @@ export function schedulingUseCases(scheduling: Scheduling, options: { holdTtlMs?
         const evaluatedAt = await transaction.currentTime();
         const decision = decideConfirmation(reservation, evaluatedAt);
         if (decision.state !== reservation.state) {
-          await transaction.setReservationState(reservation.id, decision.state);
-          if (decision.state === "EXPIRED") await transaction.recordSlotRelease(reservation, "EXPIRED", evaluatedAt);
-          if (reservation.waitingListEntryId) await transaction.closeWaitingListEntry(reservation.waitingListEntryId,
-            decision.state === "CONFIRMED" ? "ACCEPTED" : "EXPIRED");
+          if (decision.state === "EXPIRED") await expireReservation(transaction, reservation, evaluatedAt);
+          else {
+            await transaction.setReservationState(reservation.id, decision.state);
+            if (reservation.waitingListEntryId) await transaction.closeWaitingListEntry(reservation.waitingListEntryId, "ACCEPTED");
+          }
         }
         const body = represent({ ...reservation, state: decision.state });
         return { status: decision.allowed ? 200 : 409, body: decision.allowed ? body : { ...body, code: decision.code } };
@@ -74,9 +76,7 @@ export function schedulingUseCases(scheduling: Scheduling, options: { holdTtlMs?
           if (!reservation || !["HELD", "OFFERED"].includes(reservation.state)) return false;
           const evaluatedAt = await transaction.currentTime();
           if (!evaluateReservation(reservation, evaluatedAt).expired) return false;
-          await transaction.setReservationState(reservation.id, "EXPIRED");
-          await transaction.recordSlotRelease(reservation, "EXPIRED", evaluatedAt);
-          if (reservation.waitingListEntryId) await transaction.closeWaitingListEntry(reservation.waitingListEntryId, "EXPIRED");
+          await expireReservation(transaction, reservation, evaluatedAt);
           return true;
         });
         if (expired) expiredCount++;

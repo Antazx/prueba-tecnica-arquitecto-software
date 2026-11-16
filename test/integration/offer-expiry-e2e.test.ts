@@ -1,36 +1,11 @@
-import { spawn } from "node:child_process";
-import { once } from "node:events";
 import { expect, it } from "vitest";
 import { createDatabasePool } from "../../src/scheduling/adapters/postgres/database.ts";
-import { eventually, freePort, startApiPair } from "../helpers/concurrency.ts";
+import { eventually, startApiPair } from "../helpers/concurrency.ts";
+import { startWorkerProcess } from "../helpers/worker-process.ts";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const rabbitmqUrl = process.env.TEST_RABBITMQ_URL;
 if (!databaseUrl || !rabbitmqUrl) throw new Error("TEST_DATABASE_URL and TEST_RABBITMQ_URL are required");
-
-async function startWorker(database: string) {
-  const port = await freePort();
-  const child = spawn(process.execPath, ["src/bootstrap/worker.ts"], { cwd: process.cwd(), env: {
-    ...process.env, DATABASE_URL: database, RABBITMQ_URL: rabbitmqUrl, HOST: "127.0.0.1", WORKER_HEALTH_PORT: String(port),
-    RELAY_ENABLED: "true", EXPIRY_SWEEP_INTERVAL_MS: "30", OFFER_MAXIMUM_MS: "2200",
-  }, stdio: ["ignore", "pipe", "pipe"] });
-  let logs = "";
-  child.stdout?.on("data", (chunk: Buffer) => { logs += chunk.toString(); });
-  child.stderr?.on("data", (chunk: Buffer) => { logs += chunk.toString(); });
-  const stop = async () => {
-    if (child.exitCode !== null) return;
-    const exited = once(child, "exit"); child.kill("SIGTERM");
-    const timer = setTimeout(() => child.kill("SIGKILL"), 5000);
-    try { await exited; } finally { clearTimeout(timer); }
-  };
-  try {
-    await eventually(async () => {
-      if (child.exitCode !== null) throw new Error(logs);
-      try { return (await fetch(`http://127.0.0.1:${port}/health/ready`)).ok; } catch { return false; }
-    }, Boolean, 10000);
-    return { stop, logs: () => logs };
-  } catch (error) { await stop(); throw error; }
-}
 
 it.each([false, true])("AC69: expires an offer whose notification remains pending, omits the old notice and only offers a future slot; started=%s", async (started) => {
   const name = `offer_notice_e2e_${Date.now()}_${process.pid}`;
@@ -39,7 +14,7 @@ it.each([false, true])("AC69: expires an offer whose notification remains pendin
   const target = new URL(databaseUrl); target.pathname = `/${name}`;
   const pool = createDatabasePool(target.toString());
   const apis = await startApiPair(target.toString(), `offer-notice-${started}`);
-  let worker: Awaited<ReturnType<typeof startWorker>> | undefined;
+  let worker: Awaited<ReturnType<typeof startWorkerProcess>> | undefined;
   const scope = { hospitalId: "hospital-south", testTypeId: "mri" };
   const post = async (path: string, patientId: string, key?: string, body?: object) => {
     const response = await fetch(`${apis.a.url}${path}`, { method: "POST", headers: {
@@ -67,7 +42,7 @@ it.each([false, true])("AC69: expires an offer whose notification remains pendin
     if (started) await pool.query(`UPDATE scheduling.slots SET starts_at=date_trunc('milliseconds',clock_timestamp())+interval '1800 milliseconds',
       ends_at=date_trunc('milliseconds',clock_timestamp())+interval '30 minutes' WHERE id='slot-south-mri-1'`);
     expect((await post(`/reservations/${held.body.id}/cancel`, "patient-carlos")).status).toBe(200);
-    worker = await startWorker(target.toString());
+    worker = await startWorkerProcess(target.toString(), rabbitmqUrl, { offerMaximumMs: 2200 });
     const offered = await eventually(() => get(ana.body.id, "patient-ana"), (entry) => entry.state === "OFFERED", 8000);
     const notice = (await pool.query(`SELECT p.id,p.event_id,p.published_at,p.available_at FROM scheduling.outbox_publications p JOIN scheduling.events e ON e.id=p.event_id
       WHERE e.type='OfferCreated' AND e.payload->>'reservationId'=$1`, [offered.offer.id])).rows[0];

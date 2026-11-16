@@ -51,7 +51,7 @@ exacta de milisegundos se demuestra en reglas puras, no con fake timers sobre BD
 | AC37 | [I/message-retries](../test/integration/message-retries.test.ts): “retains a committed failure across SIGKILL”; ciclo transportado | Fallo/intento siguiente guardados antes del ack y conservados tras reiniciar, sin adelantar fecha. |
 | AC38 | [I/message-retries](../test/integration/message-retries.test.ts): “duplicate win after rollback”, “uncertain successful commit” | Proxy PG retiene rollback/pierde respuesta commit; terminal ganador evita fallo incompatible. |
 | AC39 | [U/message-retries](../test/unit/message-retries.test.ts); [I/message-retries](../test/integration/message-retries.test.ts): “four real transported attempts” | Esperas reales 5/30/120 s, cuatro intentos y aparcado; envíos nunca anteriores a not_before. |
-| AC40 | [U/notification](../test/unit/notification.test.ts); [I/message-retries](../test/integration/message-retries.test.ts): permanente, outage BD y salida rota | Permanente aparca; inválido descarta; indisponibilidad compartida pausa sin agotar presupuestos en masa. |
+| AC40 | [U/notification](../test/unit/notification.test.ts); [I/message-retries](../test/integration/message-retries.test.ts): permanente, outage BD, salida rota y “shared output stalls” | Permanente aparca; inválido descarta; salida bloqueada pausa sin acumular escrituras ni gastar intentos y recupera los mismos intentos originales. |
 | AC41 | [U/environment](../test/unit/environment.test.ts); [I/relay-recovery](../test/integration/relay-recovery.test.ts) AC35; [I/async-offers-e2e](../test/integration/async-offers-e2e.test.ts) | Un relay explícito; otro worker consume/barre sin asumir publicación. |
 | AC42 | [I/offers](../test/integration/offers.test.ts): “omits an expired notice”, “revalidates a now invalid offer”; [I/offer-expiry-e2e](../test/integration/offer-expiry-e2e.test.ts) | Descarte no toca reserva ni busca sustituta; retry vuelve a comprobar vigencia. |
 | AC43 | [I/offers](../test/integration/offers.test.ts): “checked before acceptance”, “real log after the checked deadline”, “checked notice after rejection” | Log puede completar tras aceptación/vencimiento/rechazo; plazo original y R2 posterior intactos. |
@@ -132,7 +132,10 @@ las 9 publicadas conservaron sus contadores y el negocio quedó idéntico.
 La recreación conjunta dejó 5 huecos, 3 pacientes, 4 recursos y ninguna fila de
 negocio, clave, evento, outbox o historial de consumidor, con las cuatro colas vacías.
 
-| Comprobación local | Resultado ejecutado |
+La siguiente tabla conserva los resultados completos anteriores a las correcciones
+de revisión, cuya base es `92fa49d`:
+
+| Comprobación local anterior | Resultado ejecutado |
 | --- | --- |
 | `pnpm typecheck` | Aplicación y pruebas estrictas, correcto |
 | `pnpm test` | 51 pruebas unitarias, 11 archivos, correcto |
@@ -142,7 +145,50 @@ negocio, clave, evento, outbox o historial de consumidor, con las cuatro colas v
 | Compose desde vacío, retención/progreso, recreación conjunta | Correctos sobre proyecto sintético propio |
 | Topología efectiva y esquema/roundtrip AMQP | Correctos |
 
-No se repitió la suite conjunta tras cambios exclusivamente documentales.
+Estos resultados completos no son una nueva ejecución tras las correcciones siguientes.
 El diseño funcional conserva SHA-256
 `c941187ff1c7f1ff493464ec3906b83c37acce96c130c7781d5c9682073c65f8` y el PDF original
 permanece intacto.
+
+## Correcciones tras la revisión
+
+El timeout de una salida compartida sin progreso ahora pausa el consumo. El
+escritor conserva una única escritura pendiente hasta su callback; durante la
+pausa no encola otros avisos. Los errores específicos de escritura mantienen su
+tratamiento de fallo lógico. Se extrajeron los efectos comunes de caducidad sin
+mover selección, tiempo protegido ni actualización local, y los tres recorridos
+E2E/relay reutilizan el helper existente de procesos worker con sus plazos originales.
+
+Las dos regresiones nuevas fallaron antes del cambio: la unitaria recibió un
+`Error` corriente y la integración resolvió el consumo en lugar de pausar.
+Después pasan con un `Writable` real bloqueado y PostgreSQL real: dos avisos y
+consumos repetidos conservan las publicaciones de intento `0`, sin filas de fallo ni
+resultado prematuro; al drenar, ambos completan ese mismo intento. Solo la prueba
+unitaria controla el timeout técnico con fake timers; la integración espera los
+cinco segundos reales y usa el reloj de PostgreSQL.
+
+| Comprobación local tras las correcciones, 2026-11-16 | Resultado ejecutado |
+| --- | --- |
+| `pnpm typecheck` y `pnpm build` | Correctos, aplicación y pruebas estrictas |
+| `pnpm test` | 52 unitarias, 11 archivos, correcto |
+| Integraciones de caducidad, lista, reservas, avisos y los tres recorridos del helper | 77 pruebas, 7 archivos, 38,29 s, correcto |
+| `message-retries` filtrado por salida compartida, intento original, permanente y terminales | 4 pruebas, 8 omitidas por filtro, 5,40 s, correcto |
+| `git diff --check` e integridad de las fuentes funcionales | Correctos |
+
+Los comandos de integración ejecutados, con las URLs sintéticas configuradas
+como indica el README, son:
+
+```bash
+pnpm exec vitest run test/integration/offer-expiry.test.ts \
+  test/integration/waiting-list.test.ts test/integration/reservation-lifecycle.test.ts \
+  test/integration/offers.test.ts test/integration/async-offers-e2e.test.ts \
+  test/integration/offer-expiry-e2e.test.ts test/integration/relay-recovery.test.ts
+pnpm exec vitest run test/integration/message-retries.test.ts \
+  -t 'shared output|original notification attempts|permanent failure|terminal outcomes'
+```
+
+Se ejecutaron 81 integraciones afectadas, sin repetir localmente las esperas
+no afectadas de 155 s y del traslado DLX. Tampoco se repitieron las comprobaciones
+de retención/recreación: no cambian esquema, topología, Compose ni arranque.
+La suite completa y la CI del SHA final publicado siguen pendientes de consulta;
+estos resultados locales no acreditan esa ejecución remota.
