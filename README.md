@@ -1,8 +1,8 @@
 # Citación de pruebas diagnósticas
 
-Preparación técnica de la [prueba de arquitectura de software](docs/diagnostic-appointment-requirements.pdf).
-Esta entrega prepara el entorno y sus conexiones. La agenda, los bloqueos, las citas
-y la lista de espera se implementarán en las siguientes entregas funcionales.
+Implementación de la [prueba de arquitectura de software](docs/diagnostic-appointment-requirements.pdf).
+Esta entrega permite arrancar una agenda sintética validada y consultarla por HTTP.
+Los bloqueos, las citas y la lista de espera corresponden a las siguientes entregas.
 
 ## Diseño funcional acordado
 
@@ -12,10 +12,11 @@ Incorpora las últimas respuestas aceptadas y las correcciones de trazabilidad
 de Q24. La [referencia técnica](docs/technical-design.md) registra su procedencia
 y verificación de integridad. El [glosario](GLOSSARY.md) recoge su vocabulario.
 Este resumen refleja las decisiones vigentes, incluidas las revisiones del
-grilling; todavía no describe comportamientos implementados ni verificados.
+grilling. El recorrido implementado y sus verificaciones se concretan más abajo;
+las reglas restantes siguen siendo trabajo pendiente.
 
-1. **Agenda precargada.** La demo usará huecos sintéticos precargados, sin
-   operaciones de administración de agendas. El seed se validará para impedir
+1. **Agenda precargada.** La demo usa huecos sintéticos precargados, sin
+   operaciones de administración de agendas. El seed se valida para impedir
    intervalos solapados de un mismo recurso. La exclusividad concurrente que
    implementará el servicio será por hueco; esa garantía, por sí sola, no impide
    solapamientos entre huecos diferentes de una máquina.
@@ -102,9 +103,8 @@ El grilling está cerrado para el alcance acordado hasta Q26. Los criterios
 AC59–AC64 cubren el bloqueo propio, otros ámbitos, vencimiento durante la espera,
 replays e inscripción existente y la convivencia permitida. AC65–AC67 cubren
 Q25–Q26; AC68–AC69 hacen visibles límites ya aceptados de Q24 y del aviso.
-La implementación funcional, la configuración de negocio y esas pruebas siguen
-pendientes.
-Los comandos siguientes corresponden a la preparación técnica actual.
+La implementación de reservas, lista de espera y mensajería de negocio sigue
+pendiente. Los comandos siguientes incluyen la consulta de agenda ya entregada.
 
 ## Arranque con un comando
 
@@ -130,12 +130,40 @@ La última comprobación verifica el esquema `scheduling` y publica, confirma, r
 y reconoce un mensaje en una cola AMQP exclusiva y efímera. La cola se elimina al
 cerrar la conexión. No crea pacientes, citas ni mensajes de negocio.
 
+## Consultar la agenda
+
+```bash
+curl --fail --get http://127.0.0.1:3000/slots \
+  --data-urlencode hospitalId=hospital-north \
+  --data-urlencode testTypeId=mri \
+  --data-urlencode from=2020-01-01T00:00:00Z \
+  --data-urlencode to=2100-01-01T00:00:00Z
+```
+
+Los cuatro filtros son obligatorios. Se incluyen los huecos cuyo inicio pertenece
+a `[from,to)` y es estrictamente posterior a `evaluatedAt`. Un ámbito desconocido
+devuelve `200` con una lista vacía. Los instantes requieren zona u offset explícito
+y como máximo tres decimales; las respuestas usan UTC y tres decimales. Un intervalo
+vacío, invertido o inválido produce `400`, también los parámetros desconocidos o
+repetidos. Para offsets positivos, `--data-urlencode` conserva el signo `+`.
+
+La respuesta contiene `evaluatedAt` y `slots`, ordenados por inicio e identificador.
+Cada hueco expone `id`, `resourceId`, `hospitalId`, `testTypeId`, `startsAt`, `endsAt`
+y `directlyBookable`; no incluye pacientes. Esta consulta pública de la demo no
+requiere `X-Patient-Id`. PostgreSQL obtiene el tiempo truncado a milisegundos y los
+huecos en una sola sentencia, con una fotografía coherente y sin escrituras.
+Es información orientativa: una reserva posterior deberá revalidarla.
+
+En esta primera entrega todos los huecos futuros son directamente reservables:
+todavía no existen reservas ni inscripciones. Los siguientes tickets incorporarán
+la ocupación persistida y la prioridad elegible a esa misma consulta.
+
 ## Disponibilidad y recuperación
 
 | Proceso | Comprobación | Dependencias para estar disponible |
 | --- | --- | --- |
 | API | `GET /health/live` | Proceso HTTP en ejecución |
-| API | `GET /health/ready` | PostgreSQL accesible y esquema inicializado |
+| API | `GET /health/ready` | PostgreSQL accesible y agenda inicializada y validada |
 | Worker | `GET /health/live` en su puerto interno 3001 | Proceso en ejecución |
 | Worker | `GET /health/ready` en su puerto interno 3001 | PostgreSQL y RabbitMQ accesibles |
 
@@ -191,8 +219,26 @@ nativo estable de Node. La compilación para la imagen genera JavaScript:
 
 ```bash
 pnpm build
+pnpm typecheck
+pnpm test
 pnpm check:connections
 ```
+
+Las pruebas de integración requieren una base de pruebas aislada, nunca una base
+con datos que se deban conservar. Un ejemplo con un proyecto y puerto propios:
+
+```bash
+POSTGRES_PORT=55434 docker compose -p agenda-tests up --wait postgres
+TEST_DATABASE_URL=postgresql://diagnostic:diagnostic_dev@127.0.0.1:55434/diagnostic_appointments pnpm test:integration
+```
+
+`pnpm test` ejecuta las reglas puras; `pnpm test:integration` comprueba el contrato
+HTTP con Fastify `inject` y PostgreSQL real. La lectura usa una conexión PostgreSQL
+de solo lectura. También comprueba reinicialización, rechazo de solapamientos y
+restricciones de intervalo y coherencia de recursos. `pnpm typecheck` comprueba
+aplicación, pruebas y configuración con TypeScript estricto; `pnpm build` genera
+la aplicación. CI ejecuta esos mismos comandos con PostgreSQL real. No hay lint ni
+formato automáticos configurados, ni se atribuye a `inject` cobertura de red E2E.
 
 Si utilizas VS Code mediante SSH, reenvía el puerto 3000 desde la ventana remota
 para acceder a la API desde el navegador del portátil.
@@ -215,12 +261,28 @@ Si cambias un puerto publicado de PostgreSQL o RabbitMQ, ajusta también la URL
 correspondiente del modo local. Los servicios de Compose conservan sus puertos
 internos. La API de Compose escucha internamente en 3000.
 
-PostgreSQL conserva su volumen entre arranques. `db/schema.sql` crea el esquema
-`scheduling`; `db/seed.sql` comprueba la inicialización sin cargar datos de negocio.
-RabbitMQ tiene su propio volumen y un nombre de nodo estable.
+PostgreSQL conserva su volumen entre arranques. `db/schema.sql` define hospitales,
+tipos, recursos, pacientes sintéticos, ámbitos y huecos, con claves que impiden
+mezclar ámbitos y restricciones que exigen intervalos no vacíos y milisegundos.
+La API ejecuta esquema y seed en una transacción de inicialización coordinada,
+valida automáticamente la agenda completa y solo después empieza a escuchar.
+Una agenda solapada de un mismo recurso impide arrancar la API. El worker exige
+la marca de validación para anunciar disponibilidad. RabbitMQ tiene su propio
+volumen y un nombre de nodo estable.
 
-Los scripts de inicialización se ejecutan sobre un volumen vacío. Al cambiar el
-esquema durante el ejercicio, regeneraremos explícitamente el entorno. El siguiente
+El seed contiene cinco huecos en tres ámbitos, cuatro recursos y tres pacientes
+(`patient-ana`, `patient-bruno`, `patient-carlos`). El primer arranque fija el
+ancla al día siguiente a las 09:00 UTC en `scheduling.demo_seed`; los arranques
+posteriores insertan solo las filas ausentes usando esa misma ancla y nunca
+desplazan fechas existentes. Los huecos contiguos y simultáneos de recursos
+distintos son válidos. El dataset queda por debajo de veinte futuros por ámbito;
+ese límite no restringe el endpoint. Tras pasar sus fechas, la agenda deja de
+tener huecos futuros: para otra demostración se requiere la recreación explícita
+del entorno sintético, no un reinicio normal.
+
+Los scripts SQL de PostgreSQL se ejecutan sobre un volumen vacío; además la API
+los aplica de forma idempotente antes de servir. No se ofrecen migraciones de
+bases pobladas. Para recrear explícitamente toda la demo, el siguiente
 comando elimina los volúmenes y sus datos locales:
 
 ```bash
@@ -246,6 +308,7 @@ docker compose down
 | `pg` | 8.23.1 | SQL y cliente transaccional explícitos, sin ORM |
 | RabbitMQ | 4.4.0 | Broker independiente de la base de datos, con soporte comunitario vigente |
 | `amqplib` | 2.3.1 | Control directo de conexiones, confirmaciones y acuses AMQP |
+| Vitest | 5.1.0 | Pruebas de reglas puras, contrato HTTP e integración SQL |
 
 Usamos LTS cuando existe y versiones estables soportadas en el resto. RabbitMQ
 distingue soporte comunitario y soporte prolongado comercial; no se presupone una
@@ -263,23 +326,22 @@ src/
 ├── config/                        Lectura de configuración por proceso
 └── scheduling/
     └── adapters/
-        ├── http/                  API y comprobaciones de disponibilidad
-        ├── postgres/              Pool y comprobación del esquema
+        ├── http/                  API, agenda y comprobaciones de disponibilidad
+        ├── postgres/              Pool, inicialización validada y lectura de agenda
         └── rabbitmq/              Conexión AMQP
 ```
 
-El dominio y los casos de uso se incorporarán a `scheduling/domain/` y
-`scheduling/application/` al trabajar las funcionalidades. No se crean modelos,
-repositorios genéricos ni reglas de negocio de ejemplo durante esta preparación.
+`scheduling/domain/` contiene la validación pura de agenda e instantes;
+`scheduling/application/` define el contrato de lectura. No se imponen repositorios
+CRUD genéricos ni se adelantan transacciones de funcionalidades aún pendientes.
 
 ## Alcance pendiente
 
-- Funcionalidades del PDF: agenda, bloqueos con caducidad, confirmaciones,
+- Funcionalidades del PDF: bloqueos con caducidad, confirmaciones,
   cancelaciones, exclusividad bajo concurrencia y lista de espera con ofertas.
 - Transactional Outbox e Idempotent Consumer, acordados para la entrega funcional.
-- Seed de negocio, con datos exclusivamente sintéticos.
-- Preparación de calidad: configuración de Vitest, suites automatizadas, lint,
-  formato y CI. Se abordará en la siguiente fase de preparación.
+- Ampliar las suites y CI al entregar las siguientes funcionalidades. Herramientas
+  adicionales de lint/formato siguen siendo propuestas.
 
 ## Mensajería: garantías previstas
 
