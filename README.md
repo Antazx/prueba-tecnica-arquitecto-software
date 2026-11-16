@@ -48,6 +48,53 @@ huecos. Si sus fechas ya pasaron, usa la recreación explícita descrita abajo.
 El esquema inicializa la demo desde vacío; no ofrece migraciones de bases de
 entregas anteriores. Una configuración incompatible debe diagnosticarse.
 
+## Documentación interactiva y OpenAPI
+
+El mismo arranque sirve [Swagger UI](http://127.0.0.1:3000/docs) y el
+[contrato JSON OpenAPI 3.2.1](http://127.0.0.1:3000/openapi.json). No hay
+servicio documental ni paso de generación separado: se genera desde los esquemas
+registrados en Fastify. La interfaz descarga ese mismo JSON y sirve sus recursos
+con la aplicación, sin CDN ni envío a un validador externo.
+
+```bash
+curl --fail http://127.0.0.1:3000/openapi.json -o /tmp/diagnostic-openapi.json
+```
+
+Esta entrega documenta `GET /health/live`, `GET /health/ready` y `GET /slots`.
+Las ocho operaciones de reservas y lista de espera siguen disponibles por HTTP;
+su incorporación al contrato se completa en las entregas #18 y #19. La prueba de
+cobertura captura las once operaciones de la aplicación completa mediante
+`onRoute`: las tres cubiertas y las ocho pendientes son explícitas. Los HEAD que
+Fastify deriva copiando el manejador y esquema GET se registran por separado;
+un HEAD con manejador propio sigue siendo una operación pública. Las rutas de
+artefactos documentales se comprueban aparte.
+
+En Swagger UI, despliega una consulta de salud y pulsa **Execute**. Para agenda,
+usa `hospitalId=hospital-north`, `testTypeId=mri`,
+`from=2020-01-01T00:00:00Z` y `to=2100-01-01T00:00:00Z`; los ejemplos ya están
+cargados. La respuesta conserva los IDs del seed y sus fechas persistidas. Si
+los huecos ya empezaron, la lista puede estar vacía. `directlyBookable` expresa
+una fotografía; consultar no reserva capacidad. Borra un parámetro obligatorio
+para observar `400 INVALID_REQUEST`; un instante sin zona devuelve
+`400 INVALID_INTERVAL` con su mensaje.
+
+Versiones exactas: `@fastify/swagger` 9.9.3 y `@fastify/swagger-ui` 6.1.4
+(incorpora Swagger UI 5.34.0). El generador
+[incorporó OpenAPI 3.2 en 9.9.0](https://github.com/fastify/fastify-swagger/releases/tag/v9.9.0)
+y la [tabla oficial de Swagger UI](https://github.com/swagger-api/swagger-ui#compatibility)
+recoge soporte desde 5.32.0. El parche 3.2.1 del documento se comprueba con
+[`@seriousme/openapi-schema-validator` 2.11.0](https://github.com/seriousme/openapi-schema-validator)
+para estructura y referencias, más Ajv 8.20.0 y `ajv-formats` 3.0.1 para compilar
+los esquemas JSON Schema 2020-12 y contrastar las respuestas HTTP. Se comprueba
+además que el verificador rechaza referencias rotas, esquemas inválidos y
+respuestas incompatibles. Fastify y el resto del stack conservan sus versiones.
+
+`pnpm test` ejecuta documento, interfaz, inventario y salud/errores controlados;
+`pnpm test:integration` contrasta también las consultas y errores de agenda con
+PostgreSQL real. Ambos forman parte de la CI existente, junto con `pnpm typecheck`
+y `pnpm build`. Los errores provocados en la frontera de dependencias comprueban
+la representación HTTP, sin acreditar disponibilidad real de PostgreSQL.
+
 ## Recorrido breve: cancelación → oferta → aceptación
 
 Parte de una demo recién creada y usa el único hueco de `hospital-south/mri`.
@@ -399,7 +446,7 @@ en la revisión 5 y los ADR, sin una segunda especificación en este README.
 
 ## Fuera de alcance
 
-No hay interfaz gráfica, administración de agendas, integración HIS/EHR, pagos,
+No hay interfaz gráfica de pacientes, administración de agendas, integración HIS/EHR, pagos,
 asistencia/realización clínica, notificaciones SMS/email, autenticación real ni
 validación clínica de compatibilidad. Tampoco despliegue productivo, HA, liderazgo
 automático, política clínica de retención, backup/restauración, métricas/SLO o
