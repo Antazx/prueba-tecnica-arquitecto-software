@@ -285,7 +285,9 @@ it.each(["base", "excluded-prefix", "crash-before-relay", "duplicates", "reoccup
     expect((await post(`/reservations/${holds["decision-test-h2"]}/cancel`, "patient-carlos")).status).toBe(200);
     const h2Release = (await publications()).find((row) => row.payload.reservationId === holds["decision-test-h2"]);
     if (!h2Release) throw new Error("Expected H2 release");
-    await eventually(async () => (await pool.query("SELECT outcome FROM scheduling.consumer_results WHERE event_id=$1 AND consumer='allocation'", [h2Release.event_id])).rows[0]?.outcome, (outcome) => outcome === "succeeded", 10000);
+    await eventually(async () => (await pool.query(`SELECT r.outcome FROM scheduling.consumer_results r
+      JOIN scheduling.outbox_publications p ON p.event_id=r.event_id AND p.consumer=r.consumer
+      WHERE r.event_id=$1 AND r.consumer='allocation' AND p.published_at IS NOT NULL`, [h2Release.event_id])).rows[0]?.outcome, (outcome) => outcome === "succeeded", 10000);
     expect((await pool.query("SELECT id FROM scheduling.reservations WHERE slot_id='decision-test-h2' AND state='OFFERED'")).rows).toEqual([]);
     expect((await pool.query("SELECT published_at FROM scheduling.outbox_publications WHERE id=$1", [h2Release.id])).rows[0].published_at).not.toBeNull();
 
@@ -309,15 +311,20 @@ it.each(["base", "excluded-prefix", "crash-before-relay", "duplicates", "reoccup
     }
     if (variant === "started") await eventually(async () => (await pool.query("SELECT clock_timestamp() >= starts_at AS started FROM scheduling.slots WHERE id='decision-test-h1'")).rows[0].started, Boolean, 8000);
     if (variant === "duplicates") {
-      const connection = await connect(rabbitmqUrl); const channel = await connection.createConfirmChannel();
+      const barrier = await holdScope(pool, scope.hospitalId, scope.testTypeId);
       try {
-        await assertTopology(channel);
-        await publishConfirmed(channel, "appointments.work", "allocation", envelope(release));
-        await publishConfirmed(channel, "appointments.work", "allocation", { ...envelope(release), publicationId: release.id });
-      } finally { await channel.close(); await connection.close(); }
-      secondWorker = await startWorkerProcess(databaseUrl, rabbitmqUrl, { relay: false, applicationName: "decision-test-worker-b" });
+        const connection = await connect(rabbitmqUrl); const channel = await connection.createConfirmChannel();
+        try {
+          await assertTopology(channel);
+          await publishConfirmed(channel, "appointments.work", "allocation", envelope(release));
+          await publishConfirmed(channel, "appointments.work", "allocation", envelope(release));
+        } finally { await channel.close(); await connection.close(); }
+        secondWorker = await startWorkerProcess(databaseUrl, rabbitmqUrl, { relay: false, applicationName: "decision-test-worker-b" });
+        worker = await startWorkerProcess(databaseUrl, rabbitmqUrl);
+        await awaitBlocked(pool, [worker.applicationName, secondWorker.applicationName], barrier.pid);
+      } finally { await barrier.release(); }
     }
-    if (delayed) worker = await startWorkerProcess(databaseUrl, rabbitmqUrl);
+    if (delayed && !worker) worker = await startWorkerProcess(databaseUrl, rabbitmqUrl);
     // Observational SQL only: no new business request or replay of H2 can activate this wait.
     const next = await eventually(async () => (await pool.query("SELECT id,slot_id FROM scheduling.reservations WHERE waiting_list_entry_id=$1 AND state='OFFERED'", [joined.body.id])).rows[0], (row) => row?.slot_id === "decision-test-h2", 10000);
     expect(next.id).not.toBe(first.id);
@@ -332,3 +339,38 @@ it.each(["base", "excluded-prefix", "crash-before-relay", "duplicates", "reoccup
     process.stdout.write(`H1/H2 network evidence ${JSON.stringify({ variant, entry: joined.body.id, first: first.id, next: next.id, h2AlreadyCompleted: h2Release.event_id, rejectionEvent: release.event_id })}\n`);
   } finally { await worker?.stop(); await secondWorker?.stop(); }
 }, 25000);
+
+it.each([
+  { action: "reject", first: "request" }, { action: "reject", first: "sweep" },
+  { action: "withdraw", first: "request" }, { action: "withdraw", first: "sweep" },
+])("coordinates $action against the periodic offer sweep with $first first and two API pools", async ({ action, first }) => {
+  const { entry, offer } = await offerToAna();
+  const worker = await startWorkerProcess(databaseUrl, "amqp://diagnostic:diagnostic_dev@127.0.0.1:1", {
+    applicationName: `decision-test-sweep-${action}-${first}`, requireRabbitmq: false, relay: false,
+  });
+  const barrier = await holdScope(pool, scope.hospitalId, scope.testTypeId);
+  const deadline = (await pool.query<{ expires_at: Date }>(`UPDATE scheduling.reservations
+    SET expires_at=date_trunc('milliseconds',clock_timestamp())+ $2*interval '1 millisecond'
+    WHERE id=$1 RETURNING expires_at`, [offer.id, first === "request" ? 900 : -1])).rows[0].expires_at;
+  const path = action === "reject" ? `/reservations/${offer.id}/reject` : `/waiting-list-entries/${entry.id}/withdraw`;
+  let a: ReturnType<typeof post> | undefined;
+  let b: ReturnType<typeof post> | undefined;
+  try {
+    if (first === "sweep") await awaitBlocked(pool, [worker.applicationName], barrier.pid);
+    a = post(path); b = post(path, "patient-ana", servers.b);
+    const waiting = await awaitBlocked(pool, [servers.a.applicationName, servers.b.applicationName], barrier.pid);
+    if (first === "request") {
+      for (const request of waiting) expect(request.xact_start.getTime()).toBeLessThan(deadline.getTime());
+      await eventually(async () => (await pool.query("SELECT clock_timestamp() >= $1 AS expired", [deadline])).rows[0].expired, Boolean);
+    }
+    await awaitBlocked(pool, [worker.applicationName, servers.a.applicationName, servers.b.applicationName], barrier.pid);
+    await barrier.release();
+    const responses = await Promise.all([a, b]);
+    for (const response of responses) expect(response).toMatchObject(action === "reject"
+      ? { status: 409, body: { id: offer.id, state: "EXPIRED", code: "RESERVATION_EXPIRED" } }
+      : { status: 200, body: { id: entry.id, state: "CLOSED", closureReason: "EXPIRED" } });
+    expect(await releaseCount(offer.id)).toBe(1);
+    expect((await pool.query("SELECT reason FROM scheduling.reservation_closures WHERE reservation_id=$1", [offer.id])).rows).toEqual([{ reason: "EXPIRED" }]);
+    expect((await api.getWaitingListEntry("patient-ana", entry.id)).body).toMatchObject({ state: "CLOSED", closureReason: "EXPIRED", excludedSlotIds: [] });
+  } finally { await barrier.release(); await Promise.allSettled([a, b].filter((pending) => pending !== undefined)); await worker.stop(); }
+}, 15000);
