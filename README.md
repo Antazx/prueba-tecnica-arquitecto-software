@@ -4,10 +4,12 @@ Implementación de la [prueba de arquitectura de software](docs/diagnostic-appoi
 Esta entrega permite consultar una agenda sintética validada, bloquear un hueco
 con exclusividad, confirmar o cancelar la reserva y caducar los bloqueos desde
 el worker. Cada liberación conserva su evento y publicación pendiente en
-PostgreSQL. También permite alta, consulta y retirada de espera sin oferta,
+PostgreSQL. También permite alta, consulta y retirada de espera con o sin oferta,
 con FIFO persistido y prioridad frente a reserva directa. La outbox y RabbitMQ
 conectan la revisión del ámbito, las ofertas exclusivas y su aviso estructurado.
 Aceptar una oferta vigente confirma esa misma reserva y cierra la inscripción.
+Rechazar una fecha conserva la inscripción y su antigüedad para otros huecos;
+retirarse cierra esa participación y libera su oferta si procede.
 
 ## Diseño funcional acordado
 
@@ -79,8 +81,8 @@ sin elección de líder, bloqueo asesor ni relevo automático en la demo. El rel
 publicará secuencialmente y conservará una próxima fecha durable tras un fallo,
 permitiendo avanzar a otras publicaciones listas cuya ruta funcione.
 
-Un rechazo válido guardará un único `SlotReleased`, que ya activa la revisión
-completa del ámbito. No añadirá otra solicitud por ese mismo rechazo. Una
+Un rechazo válido guarda un único `SlotReleased`, que ya activa la revisión
+completa del ámbito. No añade otra solicitud por ese mismo rechazo. Una
 admisión real sin liberación que cubra su activación guardará
 `AllocationReviewRequested` en la misma transacción.
 
@@ -111,8 +113,8 @@ replays e inscripción existente y la convivencia permitida. AC65–AC67 cubren
 Q25–Q26; AC68–AC69 hacen visibles límites ya aceptados de Q24 y del aviso.
 Están implementados la consulta de agenda, los bloqueos, su consulta propia,
 confirmación, cancelación y barrido de bloqueos vencidos con outbox, además del
-alta/consulta/retirada de espera sin oferta y su prioridad, adjudicación asíncrona,
-aviso y aceptación. Rechazo, retirada con oferta, barrido de ofertas, reinscripción
+alta/consulta/retirada de espera y su prioridad, adjudicación asíncrona,
+aviso, aceptación y rechazo. El barrido de ofertas, reinscripción
 completa y recuperación de mensajería siguen pendientes.
 
 ## Arranque con un comando
@@ -209,7 +211,7 @@ Si un temporal ha vencido, informa cierre pendiente y deshabilita las acciones,
 sin modificar filas. Una confirmada no vence por su antiguo plazo. Las acciones
 describen permisos funcionales de Q26. Confirmar y cancelar vuelven a validar
 estado y tiempo. Una oferta se acepta mediante el mismo endpoint de confirmación;
-su rechazo y la retirada con oferta se incorporarán después.
+su rechazo conserva antigüedad y excluye únicamente el hueco rechazado.
 
 Cabecera ausente o inválida, paciente inexistente, clave ausente o cuerpo dan
 `400`; recurso inexistente o ajeno da el mismo `404 NOT_FOUND`. El POST responde
@@ -364,8 +366,41 @@ con el vencimiento muestra `OFFERED` persistido y cierre pendiente, con las acci
 deshabilitadas, sin escribir. Una clave nueva devuelve una activa vigente con
 `200`, incluida su oferta, aunque haya un bloqueo propio permitido en otro hueco.
 Un replay histórico conserva su cuerpo/código iniciales. La normalización de
-ofertas vencidas en nuevas altas y la reinscripción completa son parte de #10;
-la retirada con oferta y su rechazo son parte de #9.
+ofertas vencidas en nuevas altas y la reinscripción completa son parte de #10.
+
+## Rechazar una fecha o retirar la participación
+
+```bash
+curl --fail -X POST http://127.0.0.1:3000/reservations/ID_OFERTA/reject \
+  -H 'X-Patient-Id: patient-ana'
+curl --fail -X POST http://127.0.0.1:3000/waiting-list-entries/ID_INSCRIPCION/withdraw \
+  -H 'X-Patient-Id: patient-ana'
+```
+
+Ambos POST requieren identidad y el ID concreto, sin cuerpo ni clave de creación.
+Rechazar una oferta propia vigente devuelve `200` con la misma reserva en
+`CANCELLED`, causa durable `OFFER_REJECTED`. La inscripción vuelve a `WAITING`,
+conserva su orden y añade una exclusión única para ese hueco. Estado, inscripción,
+exclusión y una sola liberación se comprometen juntos. El consumidor revisa todo
+el ámbito: puede ofrecer H2 aunque H1 esté excluido, reocupado o haya empezado.
+Si H2 ya se liberó y su revisión terminó mientras Ana tenía H1, el rechazo basta
+para activar esa nueva oferta; no necesita otra liberación ni otro mensaje de alta.
+
+En igualdad con el vencimiento o después, el rechazo materializa `EXPIRED`, cierra
+la inscripción por caducidad, guarda la liberación y devuelve
+`409 RESERVATION_EXPIRED`. No recupera espera ni añade exclusión. Repetir un
+rechazo válido anterior conserva su `200 CANCELLED`, incluso tras el plazo
+original, sin tocar ofertas posteriores. `/cancel` sigue sin admitir `OFFERED`.
+
+Retirar una inscripción con oferta vigente cancela esa reserva con causa
+`WITHDRAWN`, cierra la inscripción por retirada y libera atómicamente. Si la oferta
+ya venció, materializa caducidad y conserva esa causa. En ambos casos devuelve
+`200` con la inscripción cerrada y su causa real. Una retirada sobre un ID ya
+cerrado conserva su causa, una cita aceptada y cualquier reinscripción posterior.
+Si aceptación gana la coordinación, la cita permanece confirmada; si retirada
+gana, la aceptación posterior devuelve conflicto. El tiempo se obtiene de
+PostgreSQL después de esperar, por lo que iniciar la petición antes del límite
+no concede vigencia adicional. Estas operaciones no amplían la condición Q24.
 
 ## Desarrollo local
 

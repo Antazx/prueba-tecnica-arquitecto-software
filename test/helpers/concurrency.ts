@@ -51,7 +51,7 @@ async function startApi(databaseUrl: string, applicationName: string, environmen
 }
 
 async function stopApi(api: ApiProcess) {
-  if (api.child.exitCode !== null) return;
+  if (api.child.exitCode !== null || api.child.signalCode !== null) return;
   const exited = once(api.child, "exit");
   api.child.kill("SIGTERM");
   const timer = setTimeout(() => api.child.kill("SIGKILL"), 3000);

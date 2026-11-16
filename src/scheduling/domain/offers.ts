@@ -1,4 +1,16 @@
 import { evaluateReservation } from "./reservation.ts";
+import type { ReservationClosureReason, ReservationState } from "./reservation.ts";
+
+export function decideOfferRejection(reservation: { state: ReservationState; expiresAt: number; closureReason?: ReservationClosureReason }, time: number) {
+  if (reservation.state === "CANCELLED" && reservation.closureReason === "OFFER_REJECTED") {
+    return { allowed: true, state: "CANCELLED" as const, returnToWaiting: false };
+  }
+  if (reservation.state === "EXPIRED" || (reservation.state === "OFFERED" && Math.floor(time) >= Math.floor(reservation.expiresAt))) {
+    return { allowed: false, state: "EXPIRED" as const, returnToWaiting: false, reason: "EXPIRED" as const, code: "RESERVATION_EXPIRED" };
+  }
+  if (reservation.state !== "OFFERED") return { allowed: false, state: reservation.state, returnToWaiting: false, code: "RESERVATION_STATE_CONFLICT" };
+  return { allowed: true, state: "CANCELLED" as const, returnToWaiting: true, reason: "OFFER_REJECTED" as const };
+}
 
 export function evaluateEntryOffer(state: "WAITING" | "OFFERED" | "CLOSED", offer: { expiresAt: number; startsAt: number } | undefined, time: number) {
   const evaluation = offer && state === "OFFERED" ? evaluateReservation({ ...offer, state: "OFFERED" }, time) : undefined;
