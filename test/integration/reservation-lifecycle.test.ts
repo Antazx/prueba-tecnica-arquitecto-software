@@ -92,8 +92,8 @@ it("recovers overdue direct holds including started slots, while keeping confirm
   await pool.query(`UPDATE scheduling.reservations SET created_at = created_at - interval '20 minutes', expires_at = expires_at - interval '20 minutes'
     WHERE id = ANY($1::uuid[])`, [[overdue.id, started.id, confirmed.id]]);
   await pool.query("UPDATE scheduling.slots SET starts_at = starts_at - interval '4 days', ends_at = ends_at - interval '4 days' WHERE id = $1", [started.slotId]);
-  await expect(useCases.expireDirectHolds()).resolves.toBe(2);
-  await expect(useCases.expireDirectHolds()).resolves.toBe(0);
+  await expect(useCases.expireTemporaryReservations()).resolves.toBe(2);
+  await expect(useCases.expireTemporaryReservations()).resolves.toBe(0);
   const states = (await pool.query("SELECT state FROM scheduling.reservations WHERE id = ANY($1::uuid[]) ORDER BY state", [[overdue.id, started.id, confirmed.id]])).rows;
   expect(states).toEqual([{ state: "CONFIRMED" }, { state: "EXPIRED" }, { state: "EXPIRED" }]);
   expect((await pool.query("SELECT count(*)::integer AS count FROM scheduling.events WHERE payload->>'slotId' LIKE 'lifecycle-test-sweep-%'")).rows[0].count).toBe(2);

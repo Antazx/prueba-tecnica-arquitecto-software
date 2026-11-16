@@ -55,7 +55,7 @@ export interface SchedulingTransaction {
 export interface Scheduling {
   transaction<T>(work: (transaction: SchedulingTransaction) => Promise<T>): Promise<T>;
   readOwnWaitingListEntry(patientId: string, entryId: string): Promise<{ entry: WaitingListEntry; evaluatedAt: number } | null>;
-  dueDirectHolds(): Promise<{ id: string; patientId: string }[]>;
+  dueTemporaryReservations(): Promise<{ id: string; patientId: string }[]>;
   patientExists(patientId: string): Promise<boolean>;
   readOwnReservation(patientId: string, reservationId: string): Promise<{ reservation: Reservation; evaluatedAt: number } | null>;
 }

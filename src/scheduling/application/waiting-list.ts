@@ -27,12 +27,17 @@ export function representEntry(entry: WaitingListEntry): WaitingListRepresentati
     ...(entry.offer ? { offer: represent(entry.offer) } : {}) };
 }
 
-async function expireAdmissionHolds(transaction: SchedulingTransaction, state: AdmissionState, time: number, pertinent: (reservation: Reservation) => boolean) {
+async function expireAdmissionReservations(transaction: SchedulingTransaction, state: AdmissionState, time: number, pertinent: (reservation: Reservation) => boolean) {
   let released = false;
   for (const reservation of state.reservations) {
-    if (reservation.state !== "HELD" || !pertinent(reservation) || !evaluateReservation(reservation, time).expired) continue;
+    if (!["HELD", "OFFERED"].includes(reservation.state) || !pertinent(reservation) || !evaluateReservation(reservation, time).expired) continue;
     await transaction.setReservationState(reservation.id, "EXPIRED");
     await transaction.recordSlotRelease(reservation, "EXPIRED", time);
+    if (reservation.waitingListEntryId) {
+      await transaction.closeWaitingListEntry(reservation.waitingListEntryId, "EXPIRED");
+      const entry = state.entries.find((entry) => entry.id === reservation.waitingListEntryId);
+      if (entry) { entry.state = "CLOSED"; entry.closureReason = "EXPIRED"; }
+    }
     reservation.state = "EXPIRED";
     released = true;
   }
@@ -70,15 +75,15 @@ export function waitingListUseCases(scheduling: Scheduling) {
         if (!await transaction.lockWaitingListScope(scope)) return { status: 404, body: { code: "NOT_FOUND" } };
         const state = await transaction.lockAdmissionState(scope);
         const createdAt = await transaction.currentTime();
-        let released = await expireAdmissionHolds(transaction, state, createdAt, (reservation) => reservation.patientId === patientId);
-        const active = state.entries.find((entry) => entry.patientId === patientId);
+        let released = await expireAdmissionReservations(transaction, state, createdAt, (reservation) => reservation.patientId === patientId);
+        const active = state.entries.find((entry) => entry.patientId === patientId && entry.state !== "CLOSED");
         if (active) {
           active.offer = state.reservations.find((reservation) => reservation.waitingListEntryId === active.id && reservation.state === "OFFERED");
           const body = representEntry(active);
           await transaction.saveCreationResult(identity, { fingerprint, status: 200, body });
           return { status: 200, body };
         }
-        released = await expireAdmissionHolds(transaction, state, createdAt, (reservation) => reservation.startsAt > createdAt) || released;
+        released = await expireAdmissionReservations(transaction, state, createdAt, (reservation) => reservation.startsAt > createdAt) || released;
         const available = state.slots.filter((slot) => slot.startsAt > createdAt && !waitingListHasPriority(state.entries, slot.id) &&
           !state.reservations.some((reservation) => reservation.slotId === slot.id && ["HELD", "OFFERED", "CONFIRMED"].includes(reservation.state)));
         const decision = decideAdmission({ hasActiveEntry: false,

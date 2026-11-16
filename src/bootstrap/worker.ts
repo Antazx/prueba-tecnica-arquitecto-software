@@ -50,7 +50,7 @@ async function main() {
         }
         await checkDatabase(pool);
         if (Date.now() >= nextSweep) {
-          await scheduling.expireDirectHolds();
+          await scheduling.expireTemporaryReservations();
           nextSweep = Date.now() + config.expirySweepIntervalMs;
         }
         state.postgres = true;
