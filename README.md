@@ -1,785 +1,238 @@
 # Citación de pruebas diagnósticas
 
-Implementación de la [prueba de arquitectura de software](docs/diagnostic-appointment-requirements.pdf).
-Esta entrega permite consultar una agenda sintética validada, bloquear un hueco
-con exclusividad, confirmar o cancelar la reserva y caducar los temporales desde
-el worker. Cada liberación conserva su evento y publicación pendiente en
-PostgreSQL. También permite alta, consulta y retirada de espera con o sin oferta,
-con FIFO persistido y prioridad frente a reserva directa. La outbox y RabbitMQ
-conectan la revisión del ámbito, las ofertas exclusivas y su aviso estructurado.
-Aceptar una oferta vigente confirma esa misma reserva y cierra la inscripción.
-Rechazar una fecha conserva la inscripción y su antigüedad para otros huecos;
-retirarse cierra esa participación y libera su oferta si procede.
+Servicio HTTP de la [prueba técnica](docs/diagnostic-appointment-requirements.pdf):
+consulta de agenda, bloqueo temporal, confirmación, cancelación y lista de espera
+FIFO con ofertas exclusivas y avisos asíncronos. PostgreSQL decide ocupación,
+prioridad y tiempo; RabbitMQ transporta revisiones y avisos. Solo usa datos sintéticos.
 
-## Diseño funcional acordado
+La referencia funcional es la [revisión 5, Q1–Q26 y AC01–AC69](docs/functional-design.md).
+El [glosario](GLOSSARY.md), los [ADR](docs/adr/) y el
+[diseño técnico](docs/technical-design.md) explican vocabulario y decisiones.
+La [matriz de aceptación](docs/acceptance.md) enlaza criterios con pruebas y
+con las comprobaciones de entrega, distinguiendo sus límites.
 
-El [diseño funcional consolidado](docs/functional-design.md), revisión 5 de
-2026-11-16, es la referencia vigente de Q1–Q26 y los criterios AC01–AC69.
-Incorpora las últimas respuestas aceptadas y las correcciones de trazabilidad
-de Q24. La [referencia técnica](docs/technical-design.md) registra su procedencia
-y verificación de integridad. El [glosario](GLOSSARY.md) recoge su vocabulario.
-Este resumen refleja las decisiones vigentes, incluidas las revisiones del
-grilling. El recorrido implementado y sus verificaciones se concretan más abajo;
-las reglas restantes siguen siendo trabajo pendiente.
+## Arranque
 
-1. **Agenda precargada.** La demo usa huecos sintéticos precargados, sin
-   operaciones de administración de agendas. El seed se valida para impedir
-   intervalos solapados de un mismo recurso. La exclusividad concurrente
-   implementada para bloqueos es por hueco; esa garantía, por sí sola, no impide
-   solapamientos entre huecos diferentes de una máquina.
-2. **Admisión condicionada, Q2 revisada y Q24.** Primero se recuperará un éxito
-   previo de la clave; para una intención nueva se resolverán vencimientos bajo
-   coordinación y se devolverá una inscripción realmente activa si existe.
-   Solo al decidir una admisión nueva se comprobará Q24: un bloqueo directo
-   propio `HELD` vigente del mismo hospital y tipo de prueba produce
-   `409 ACTIVE_HOLD_IN_SCOPE`. Si no lo hay pero existe disponibilidad directa,
-   Q2 responderá `409` con otro motivo e información de disponibilidad. Ninguno
-   de esos rechazos crea inscripción ni registra un alta exitosa; los cierres y
-   liberaciones ya decididos se comprometen pese al conflicto. Si procede
-   admitir, inscripción, resultado exitoso y activación durable del ámbito se
-   guardarán juntos. No se prohíbe globalmente coexistir bloqueo e inscripción
-   ni se modifica el endpoint de bloqueo por Q24.
-3. **Orden de adjudicación.** Los huecos candidatos se examinarán por inicio
-   ascendente y un desempate estable. Cada uno se ofrecerá a la primera
-   inscripción elegible. Se acepta que las exclusiones dejen capacidad libre;
-   no se buscará una combinación óptima global. El
-   [ADR de adjudicación](docs/adr/0001-chronological-slot-allocation.md) conserva
-   el motivo y un ejemplo de esa consecuencia.
-4. **Límite de cancelación.** Una cita confirmada solo podrá cancelarse antes
-   del inicio del hueco; en la igualdad o después se rechazará una cancelación
-   nueva. Repetir una cancelación ya completada seguirá siendo idempotente,
-   aunque la repetición llegue después del inicio. No se añaden estados de
-   asistencia o realización de la prueba.
-5. **Validez del aviso.** El consumidor comprobará inmediatamente antes de
-   emitirlo que la reserva concreta sigue ofrecida y no ha vencido. Puede haber
-   una cancelación o caducidad entre esa comprobación y la emisión del log; la
-   garantía se refiere al instante de comprobación, no al de observación del
-   aviso. Este incluirá el vencimiento persistido y comunicará una oferta sujeta
-   a vigencia. La aceptación revalidará estado y plazo de forma atómica.
-6. **Presupuesto de reintentos.** Para fallos transitorios se acepta un intento
-   inicial y tres reintentos, con esperas de cinco segundos, treinta segundos y
-   dos minutos desde el fallo anterior. Agotado el presupuesto, el trabajo se
-   conservará en una DLQ para recuperación explícita. Una caída general de
-   dependencias deberá pausar o limitar el consumo; las reentregas físicas de
-   AMQP no equivalen automáticamente a nuevos intentos de procesamiento.
-
-El plan de pruebas deberá cubrir el alta concurrente con una liberación, el
-orden de adjudicación con exclusiones, la frontera de cancelación y su repetición,
-y el presupuesto de reintentos. Para el aviso se comprobarán la validación previa
-y la revalidación al aceptar; no se exigirá ausencia física de un log tardío si
-el consumidor ya había superado una comprobación válida.
-
-## Decisiones para el diseño técnico
-
-El [documento consolidado](docs/functional-design.md) reúne reglas, contratos,
-coordinación, tiempo, FIFO, mensajería, alternativas, pruebas previstas y
-trazabilidad hasta Q26. La [referencia técnica](docs/technical-design.md) remite
-a ese documento y recoge cómo reanudar `to-spec` tras limpiar el contexto.
-
-Hay un único relay habilitado por configuración y consumidores replicables,
-sin elección de líder, bloqueo asesor ni relevo automático en la demo. El relay
-publica secuencialmente y conserva una próxima fecha durable tras un fallo,
-permitiendo avanzar a otras publicaciones listas cuya ruta funcione.
-
-Un rechazo válido guarda un único `SlotReleased`, que ya activa la revisión
-completa del ámbito. No añade otra solicitud por ese mismo rechazo. Una
-admisión real sin liberación que cubra su activación guardará
-`AllocationReviewRequested` en la misma transacción.
-
-Q17 conserva un límite físico finito en RabbitMQ y exige traslado seguro a DLQ
-mediante `at-least-once`, `reject-publish` y DLX configurado. El presupuesto lógico
-de PostgreSQL se mantiene separado; ambos motivos de aparcado serán recuperables.
-La topología versionada y su configuración efectiva se comprueban con servicios
-reales. Los reintentos lógicos, el aparcado y la recuperación manual explícita
-de ambos orígenes están implementados.
-
-Q21 conserva los registros técnicos durante toda la vida de la demo, sin purgas
-automáticas. Q22 hace prevalecer la caducidad al intentar cancelar un bloqueo
-vencido y conserva las cancelaciones válidas anteriores. Q23 permite retirarse de
-una inscripción ya cerrada sin alterar su causa, una cita confirmada ni una
-reincorporación posterior.
-
-Q25 hace prevalecer el estado actual en una confirmación repetida: `200` si la
-reserva sigue `CONFIRMED`, o `409` con su identificación y estado `CANCELLED` si
-después fue cancelada. No se repiten efectos ni se extiende a estas transiciones
-sin clave la recuperación histórica inmutable de las creaciones.
-
-Q26 diferencia en las consultas propias el estado persistido y la evaluación
-temporal de PostgreSQL: vencimiento, cierre pendiente y acciones ya no permitidas.
-Los GET no escriben ni emiten eventos; una `CONFIRMED` no caduca por su viejo plazo.
-
-El grilling está cerrado para el alcance acordado hasta Q26. Los criterios
-AC59–AC64 cubren el bloqueo propio, otros ámbitos, vencimiento durante la espera,
-replays e inscripción existente y la convivencia permitida. AC65–AC67 cubren
-Q25–Q26; AC68–AC69 hacen visibles límites ya aceptados de Q24 y del aviso.
-Están implementados la consulta de agenda, los bloqueos, su consulta propia,
-confirmación, cancelación y barrido de bloqueos vencidos con outbox, además del
-alta/consulta/retirada de espera y su prioridad, adjudicación asíncrona,
-aviso, aceptación, rechazo, barrido de ofertas y reinscripción independiente del
-barrido. También están implementados los reintentos durables, el aparcado y la
-herramienta local de recuperación manual.
-
-## Arranque con un comando
-
-Requisitos: Docker con el motor en ejecución y Docker Compose. En macOS puede usarse
-Docker Desktop. Las imágenes elegidas admiten ARM64 y AMD64.
+Requisitos: Docker con el motor en ejecución y Docker Compose. No hace falta
+instalar Node para ejecutar la demo. Desde la raíz del repositorio:
 
 ```bash
 docker compose up --build --wait
 ```
 
-El comando construye una imagen de la aplicación y arranca API, worker, PostgreSQL
-y RabbitMQ. Espera a que las comprobaciones de disponibilidad estén en verde.
-Las credenciales de Compose son ficticias, exclusivas del entorno local sintético;
-los puertos publicados se limitan a `127.0.0.1`.
+Arranca API, worker, PostgreSQL y RabbitMQ. Las imágenes y dependencias están
+fijadas; Compose publica solo en loopback. Sus credenciales son ficticias y
+exclusivas del entorno sintético. La primera construcción necesita descargar
+imágenes y paquetes. Comprueba:
 
 ```bash
 curl --fail http://127.0.0.1:3000/health/ready
 docker compose ps
-docker compose exec worker node dist/bootstrap/check-connections.js
+docker compose exec -T worker node dist/bootstrap/check-connections.js
+node scripts/verify-rabbitmq.mjs
 ```
 
-La última comprobación verifica el esquema `scheduling` y publica, confirma, recibe
-y reconoce un mensaje en una cola AMQP exclusiva y efímera. La cola se elimina al
-cerrar la conexión. No crea pacientes, citas ni mensajes de negocio.
+El último comando requiere Node en el host; verifica mediante Docker la topología
+efectiva, políticas y flags. La comprobación dentro del worker verifica esquema y
+un roundtrip AMQP confirmado en una cola exclusiva efímera, sin negocio sintético.
+La API necesita PostgreSQL y agenda válida; su disponibilidad no depende del
+broker. El worker informa PostgreSQL y RabbitMQ y responde `503` si falta alguno,
+aunque siga barriendo caducidades con PostgreSQL disponible. Ambos exponen
+`/health/live` y `/health/ready`; el puerto de salud del worker no se publica.
 
-## Consultar la agenda
+El seed crea tres pacientes (`patient-ana`, `patient-bruno`, `patient-carlos`),
+dos hospitales, dos tipos de prueba, cuatro recursos y cinco huecos en tres
+ámbitos. El primer arranque fija las fechas al día siguiente a las 09:00 UTC.
+Repetir el arranque conserva el ancla y las identidades, sin duplicar ni mover
+huecos. Si sus fechas ya pasaron, usa la recreación explícita descrita abajo.
+El esquema inicializa la demo desde vacío; no ofrece migraciones de bases de
+entregas anteriores. Una configuración incompatible debe diagnosticarse.
+
+## Recorrido breve: cancelación → oferta → aceptación
+
+Parte de una demo recién creada y usa el único hueco de `hospital-south/mri`.
+Las respuestas contienen IDs generados: sustituye `CARLOS_RESERVATION_ID`,
+`ANA_ENTRY_ID` y `ANA_OFFER_ID` por los obtenidos en cada paso.
 
 ```bash
 curl --fail --get http://127.0.0.1:3000/slots \
-  --data-urlencode hospitalId=hospital-north \
-  --data-urlencode testTypeId=mri \
-  --data-urlencode from=2020-01-01T00:00:00Z \
-  --data-urlencode to=2100-01-01T00:00:00Z
-```
+  --data-urlencode hospitalId=hospital-south --data-urlencode testTypeId=mri \
+  --data-urlencode from=2020-01-01T00:00:00Z --data-urlencode to=2100-01-01T00:00:00Z
 
-Los cuatro filtros son obligatorios. Se incluyen los huecos cuyo inicio pertenece
-a `[from,to)` y es estrictamente posterior a `evaluatedAt`. Un ámbito desconocido
-devuelve `200` con una lista vacía. Los instantes requieren zona u offset explícito
-y como máximo tres decimales; las respuestas usan UTC y tres decimales. Un intervalo
-vacío, invertido o inválido produce `400`, también los parámetros desconocidos o
-repetidos. Para offsets positivos, `--data-urlencode` conserva el signo `+`.
+curl --fail -X POST http://127.0.0.1:3000/slots/slot-south-mri-1/holds \
+  -H 'X-Patient-Id: patient-carlos' -H 'Idempotency-Key: demo-carlos-hold'
 
-La respuesta contiene `evaluatedAt` y `slots`, ordenados por inicio e identificador.
-Cada hueco expone `id`, `resourceId`, `hospitalId`, `testTypeId`, `startsAt`, `endsAt`
-y `directlyBookable`; no incluye pacientes. Esta consulta pública de la demo no
-requiere `X-Patient-Id`. PostgreSQL obtiene el tiempo truncado a milisegundos y los
-huecos en una sola sentencia, con una fotografía coherente y sin escrituras.
-Es información orientativa: una reserva posterior deberá revalidarla.
-
-`directlyBookable` es falso si existe una reserva persistida en `HELD`, `OFFERED`
-o `CONFIRMED`, aunque haya vencido su plazo temporal. GET no materializa cierres.
-También es falso cuando hay una inscripción `WAITING` del ámbito que no excluyó
-ese hueco. La prioridad se deriva de inscripciones y exclusiones, sin un marcador
-persistente de adjudicación en el hueco; se mantiene con el consumidor detenido.
-
-## Crear y consultar un bloqueo
-
-La identidad de demostración se presenta mediante `X-Patient-Id`, con uno de los
-tres pacientes sintéticos del seed. Esta cabecera puede falsificarse: demuestra
-titularidad bajo la identidad presentada, no autenticación ni protección frente
-a suplantación. No usar este modo con pacientes reales.
-
-```bash
-curl --fail -X POST http://127.0.0.1:3000/slots/slot-north-mri-1/holds \
-  -H 'X-Patient-Id: patient-ana' \
-  -H 'Idempotency-Key: ana-first-hold'
-```
-
-El POST no admite cuerpo: propietario, instante de creación y plazo los determina
-el servidor. Devuelve `201` con `id`, `slotId`, estado `HELD`, `createdAt`,
-`expiresAt`, `startsAt` y `endsAt`. El vencimiento es el menor entre creación más
-diez minutos e inicio del hueco; desde la igualdad con el inicio no crea reserva.
-El mismo paciente puede bloquear más de un hueco; no se añade una unicidad por
-paciente ni se aplica aquí la regla de admisión Q24.
-
-Guarda la clave antes del primer intento y conserva la misma para sus reintentos.
-Misma clave, paciente, operación y destino recuperan el cuerpo y el `201`
-originales, aunque la reserva haya cambiado después, sin ampliar plazo. Reutilizar
-una clave exitosa para otro hueco da `409 IDEMPOTENCY_KEY_REUSED`; pacientes
-distintos mantienen registros independientes. Un conflicto sin éxito previo se
-reevalúa al reintentar y un rollback no conserva creación o éxito parciales.
-
-Con el identificador devuelto:
-
-```bash
-curl --fail http://127.0.0.1:3000/reservations/ID_DEVUELTO \
-  -H 'X-Patient-Id: patient-ana'
-```
-
-GET añade `evaluatedAt`, `temporal.expired`, `temporal.closurePending` y `actions`
-(`canConfirm`, `canCancel`, `canRejectOffer`). El estado es siempre el persistido.
-Si un temporal ha vencido, informa cierre pendiente y deshabilita las acciones,
-sin modificar filas. Una confirmada no vence por su antiguo plazo. Las acciones
-describen permisos funcionales de Q26. Confirmar y cancelar vuelven a validar
-estado y tiempo. Una oferta se acepta mediante el mismo endpoint de confirmación;
-su rechazo conserva antigüedad y excluye únicamente el hueco rechazado.
-
-Cabecera ausente o inválida, paciente inexistente, clave ausente o cuerpo dan
-`400`; recurso inexistente o ajeno da el mismo `404 NOT_FOUND`. El POST responde
-`409 SLOT_OCCUPIED` si ya existe un ocupante, y `409 SLOT_STARTED` si se alcanzó
-el inicio. Devuelve `409 WAITING_LIST_PRIORITY` si existe espera elegible para
-ese hueco libre. Los fallos transitorios identificables de PostgreSQL dan
-`503 DEPENDENCY_UNAVAILABLE` también en GET; otros errores internos conservan
-`500 INTERNAL_ERROR`. Puede reintentarse una creación incierta con su misma clave.
-
-La transacción usa `READ COMMITTED`: coordina primero el registro único
-paciente/operación/clave y recupera su resultado después de esperar; a continuación
-bloquea la fila estable del ámbito, el hueco y sus reservas ordenadas por ID.
-Hace lecturas nuevas tras adquirir la coordinación y pide
-`date_trunc('milliseconds', clock_timestamp())` en otro comando después de leer
-el estado protegido. Reserva y resultado se guardan con el mismo cliente antes
-del commit. No mantiene bloqueos mientras responde HTTP o espera al paciente.
-Un índice único parcial sobre estados ocupantes protege además la exclusividad,
-incluidas filas vencidas aún sin cerrar. Ámbitos distintos avanzan de forma
-independiente; el mismo ámbito serializa sus escrituras breves. La espera de
-bloqueos se limita a dos segundos y las sentencias a 2,5 segundos.
-
-### Confirmar, cancelar y caducar bloqueos directos
-
-Las transiciones tampoco admiten cuerpo y se dirigen al ID concreto; no exigen
-`Idempotency-Key`:
-
-```bash
-curl --fail -X POST http://127.0.0.1:3000/reservations/ID_DEVUELTO/confirm \
-  -H 'X-Patient-Id: patient-ana'
-curl --fail -X POST http://127.0.0.1:3000/reservations/ID_DEVUELTO/cancel \
-  -H 'X-Patient-Id: patient-ana'
-```
-
-Confirmar un `HELD` vigente devuelve `200 CONFIRMED`, con el mismo ID y plazo
-original. Repetir mientras siga confirmada devuelve `200`, incluso pasado el
-antiguo TTL. Tras cancelarla, confirmar da `409 RESERVATION_STATE_CONFLICT` con
-el ID y el estado actual `CANCELLED`; nunca toca una reserva posterior del hueco.
-
-Cancelar un bloqueo vigente o una cita antes del inicio devuelve `200 CANCELLED`.
-La repetición de una cancelación válida sigue devolviendo `200`, incluso tras
-el inicio. Una cancelación nueva de una confirmada desde la igualdad con su
-inicio responde `409 APPOINTMENT_STARTED` y conserva la cita. `OFFERED` exige las
-operaciones de oferta y responde conflicto de estado en `/cancel`.
-
-En la igualdad con el vencimiento o después, confirmar o cancelar un `HELD`
-materializa `EXPIRED` y devuelve `409 RESERVATION_EXPIRED`. La caducidad y la
-liberación se comprometen pese a ese conflicto; repetir no crea más trabajo.
-Un fallo técnico revierte toda la transacción. El reloj es de PostgreSQL,
-obtenido tras esperar los bloqueos; no se usa el inicio de la transacción para
-conceder vigencia adicional.
-
-El worker inicializa esquema/seed con la misma coordinación que la API antes de
-barrer. Busca hasta 100 reservas `HELD`/`OFFERED` vencidas por pasada, ordenadas
-por vencimiento e ID, y revalida cada una bajo el mismo protocolo de ámbito, hueco y reserva.
-Recupera atrasos aunque el hueco ya haya empezado; una confirmada no caduca por
-su viejo TTL. El intervalo predeterminado es tres segundos; no acredita un plazo
-máximo de liberación.
-
-Cada cierre guarda atómicamente estado, causa en `reservation_closures`, un
-`SlotReleased` v1 en `events` y una fila en `outbox_publications`. La clave única
-de cierre por reserva protege una única liberación lógica. El evento contiene
-ámbito, hueco, reserva y causa, sin datos clínicos. El ID de publicación es
-distinto del ID del evento; consumidor lógico (`allocation`), ciclo e intento
-iniciales se conservan como referencias separadas para las siguientes entregas.
-Las tablas se retienen sin purgas. RabbitMQ inaccesible no impide guardar negocio
-y outbox; el relay recupera las publicaciones pendientes al conectar de nuevo.
-
-Para acortar una demostración local puede configurarse `DIRECT_HOLD_TTL_MS` en la
-API, entre 1 y 600000 ms (predeterminado 600000). Nunca amplía el plazo de diez
-minutos y siempre se limita al inicio. `EXPIRY_SWEEP_INTERVAL_MS` configura el
-intervalo del worker, positivo y predeterminado 3000 ms. En ejecución con Node,
-estas variables pueden añadirse al `.env` local o pasarse a Compose. El mismo
-barrido caduca ofertas y cierra su inscripción con causa `EXPIRED`.
-La liberación activa la revisión asíncrona; solo un hueco todavía futuro puede
-ofrecerse al siguiente elegible. Una cita confirmada no vence por su antiguo TTL
-y una inscripción sin oferta no caduca porque empiece un hueco.
-
-## Disponibilidad y recuperación
-
-| Proceso | Comprobación | Dependencias para estar disponible |
-| --- | --- | --- |
-| API | `GET /health/live` | Proceso HTTP en ejecución |
-| API | `GET /health/ready` | PostgreSQL accesible y agenda inicializada y validada |
-| Worker | `GET /health/live` en su puerto interno 3001 | Proceso en ejecución |
-| Worker | `GET /health/ready` en su puerto interno 3001 | PostgreSQL y RabbitMQ accesibles |
-
-La API no abre una conexión AMQP. Puede seguir disponible durante una caída del
-broker; la outbox permanece pendiente. El worker barre bloqueos aunque RabbitMQ
-esté inaccesible, revisa PostgreSQL cada tres segundos de forma predeterminada y
-vuelve a conectar a RabbitMQ tras una desconexión.
-Una dependencia no disponible produce estado HTTP 503; el proceso sigue vivo para
-recuperarse. Ambos procesos cierran sus recursos al recibir `SIGINT` o `SIGTERM`.
-
-```bash
-docker compose logs --follow api worker
-```
-
-El worker combina el barrido de temporales, dos consumidores y, cuando está
-habilitado, el relay. El barrido de temporales sigue funcionando sin broker.
-
-## Alta, consulta y retirada de espera
-
-```bash
-curl -X POST http://127.0.0.1:3000/waiting-list-entries \
+curl --fail -X POST http://127.0.0.1:3000/waiting-list-entries \
+  -H 'X-Patient-Id: patient-ana' -H 'Idempotency-Key: demo-ana-entry' \
   -H 'Content-Type: application/json' \
-  -H 'X-Patient-Id: patient-ana' \
-  -H 'Idempotency-Key: ana-waiting-1' \
-  -d '{"hospitalId":"hospital-north","testTypeId":"mri"}'
-curl --fail http://127.0.0.1:3000/waiting-list-entries/ID_DEVUELTO \
+  -d '{"hospitalId":"hospital-south","testTypeId":"mri"}'
+
+curl --fail -X POST http://127.0.0.1:3000/reservations/CARLOS_RESERVATION_ID/cancel \
+  -H 'X-Patient-Id: patient-carlos'
+
+curl --fail http://127.0.0.1:3000/waiting-list-entries/ANA_ENTRY_ID \
   -H 'X-Patient-Id: patient-ana'
-curl --fail -X POST http://127.0.0.1:3000/waiting-list-entries/ID_DEVUELTO/withdraw \
-  -H 'X-Patient-Id: patient-ana'
+docker compose logs worker
 ```
 
-El alta exige la clave y únicamente hospital/tipo de prueba en el cuerpo. Primero
-recupera un éxito anterior con su código original. Para una clave nueva coordina
-el ámbito, bloquea las filas por orden estable y obtiene el reloj de PostgreSQL.
-Materializa los bloqueos propios vencidos, incluidos los huecos ya iniciados.
-Una inscripción realmente activa se devuelve con `200` y guarda ese éxito para
-la clave nueva, sin cambiar antigüedad ni exclusiones. Antes de una admisión
-nueva también cierra los bloqueos ajenos vencidos de huecos futuros.
-
-Q24 tiene precedencia: un `HELD` propio vigente del mismo ámbito responde
-`409 ACTIVE_HOLD_IN_SCOPE`. Sin él, si existe capacidad directamente reservable,
-responde `409 DIRECT_CAPACITY_AVAILABLE` con `slots` públicos: ID, ámbito e
-inicio/fin; esas referencias permiten continuar por el endpoint de bloqueo y no
-reservan nada. Ambos conflictos conservan las caducidades y liberaciones ya
-decididas, sin crear inscripción, prioridad latente ni éxito para la clave.
-Un bloqueo en otro ámbito no activa Q24. Tampoco lo activa una cita confirmada;
-no hay prohibición general de coexistencia entre reserva e inscripción.
-
-Si no hay impedimentos, `201` devuelve una inscripción `WAITING`, con ID nuevo,
-`admissionOrder` como entero decimal en texto, `createdAt`, ámbito y exclusiones.
-Bajo el bloqueo del ámbito, el siguiente orden es el máximo histórico más uno;
-la retención del historial y la unicidad de ámbito/orden conservan FIFO incluso
-con tiempos empatados. Un índice parcial asegura una sola inscripción activa
-por paciente y ámbito. Inscripción, éxito de clave y revisión durable se guardan
-juntos. El evento `AllocationReviewRequested` v1 incluye ámbito, inscripción y
-causa de admisión, con publicación pendiente para `allocation`. Si una liberación
-de esa misma transacción ya activa el ámbito, no se añade otro evento de revisión.
-
-GET solo permite consultar la inscripción propia bajo la identidad presentada.
-Añade `evaluatedAt`, evaluación temporal y `canWithdraw`; una espera sin oferta
-no tiene vencimiento ficticio y la consulta no escribe. Retirarse de `WAITING`
-cierra con causa `WITHDRAWN` y devuelve `200`. Repetir sobre una inscripción
-cerrada conserva su causa y no modifica otra inscripción posterior ni una cita.
-Reinscribirse tras el cierre usa una clave nueva y, si procede, identidad y orden
-nuevos. Repetir una clave exitosa sigue devolviendo su representación histórica;
-GET devuelve el estado actual. Una clave exitosa reutilizada para otro ámbito da
-`409 IDEMPOTENCY_KEY_REUSED`; las claves se separan por paciente y operación.
-
-GET de una inscripción ofrecida incluye `offer` con la reserva y su vencimiento,
-`temporal` y acciones `canAcceptOffer`, `canRejectOffer`, `canWithdraw`. En la igualdad
-con el vencimiento muestra `OFFERED` persistido y cierre pendiente, con las acciones
-deshabilitadas, sin escribir. Una clave nueva devuelve una activa vigente con
-`200`, incluida su oferta, aunque haya un bloqueo propio permitido en otro hueco.
-Un replay histórico conserva su cuerpo/código iniciales. Con una clave nueva,
-una oferta propia vencida cierra la reserva y su inscripción antes de decidir
-la nueva intención, aunque el barrido esté detenido. También caducan los bloqueos
-propios vencidos de huecos ya iniciados y los demás temporales vencidos de huecos
-futuros pertinentes. Solo después se devuelve una activa real o se aplica Q24
-antes de Q2. Si procede, I2 obtiene identidad nueva y va al final; un `409` conserva
-los cierres y su outbox sin registrar un alta exitosa. Todo revierte junto ante
-un fallo técnico. Una clave que ya obtuvo éxito sigue devolviendo su resultado
-original, incluso si la participación terminó.
-
-## Rechazar una fecha o retirar la participación
+Repite el GET hasta ver `state: OFFERED`. Su `offer.id` es `ANA_OFFER_ID`; el log
+`offer_notification` correlaciona esa reserva y su `expiresAt`. La creación de la
+oferta y el aviso pasan por outbox y RabbitMQ, sin llamada síncrona desde cancelar.
+Acepta antes del vencimiento:
 
 ```bash
-curl --fail -X POST http://127.0.0.1:3000/reservations/ID_OFERTA/reject \
+curl --fail -X POST http://127.0.0.1:3000/reservations/ANA_OFFER_ID/confirm \
   -H 'X-Patient-Id: patient-ana'
-curl --fail -X POST http://127.0.0.1:3000/waiting-list-entries/ID_INSCRIPCION/withdraw \
+curl --fail http://127.0.0.1:3000/reservations/ANA_OFFER_ID \
   -H 'X-Patient-Id: patient-ana'
 ```
 
-Ambos POST requieren identidad y el ID concreto, sin cuerpo ni clave de creación.
-Rechazar una oferta propia vigente devuelve `200` con la misma reserva en
-`CANCELLED`, causa durable `OFFER_REJECTED`. La inscripción vuelve a `WAITING`,
-conserva su orden y añade una exclusión única para ese hueco. Estado, inscripción,
-exclusión y una sola liberación se comprometen juntos. El consumidor revisa todo
-el ámbito: puede ofrecer H2 aunque H1 esté excluido, reocupado o haya empezado.
-Si H2 ya se liberó y su revisión terminó mientras Ana tenía H1, el rechazo basta
-para activar esa nueva oferta; no necesita otra liberación ni otro mensaje de alta.
+La misma reserva pasa a `CONFIRMED` y la inscripción se cierra por `ACCEPTED`.
+Para observar caducidad sin cancelar, arranca una demo nueva con
+`DIRECT_HOLD_TTL_MS=10000 docker compose up --build --wait`, realiza hold y alta
+dentro de esos diez segundos y espera el barrido. Las pruebas E2E automatizadas
+cubren ese recorrido, la cancelación y el vencimiento de oferta al siguiente.
 
-En igualdad con el vencimiento o después, el rechazo materializa `EXPIRED`, cierra
-la inscripción por caducidad, guarda la liberación y devuelve
-`409 RESERVATION_EXPIRED`. No recupera espera ni añade exclusión. Repetir un
-rechazo válido anterior conserva su `200 CANCELLED`, incluso tras el plazo
-original, sin tocar ofertas posteriores. `/cancel` sigue sin admitir `OFFERED`.
+## Contrato HTTP
 
-Retirar una inscripción con oferta vigente cancela esa reserva con causa
-`WITHDRAWN`, cierra la inscripción por retirada y libera atómicamente. Si la oferta
-ya venció, materializa caducidad y conserva esa causa. En ambos casos devuelve
-`200` con la inscripción cerrada y su causa real. Una retirada sobre un ID ya
-cerrado conserva su causa, una cita aceptada y cualquier reinscripción posterior.
-Si aceptación gana la coordinación, la cita permanece confirmada; si retirada
-gana, la aceptación posterior devuelve conflicto. El tiempo se obtiene de
-PostgreSQL después de esperar, por lo que iniciar la petición antes del límite
-no concede vigencia adicional. Estas operaciones no amplían la condición Q24.
+Estas son las nueve rutas de negocio. `ID` siempre identifica una reserva o
+inscripción concreta; una asignación posterior del mismo hueco tiene otro ID.
 
-## Desarrollo local
-
-Node y pnpm tienen sus versiones fijadas en `.nvmrc` y `package.json`. Con nvm:
-
-```bash
-nvm install
-nvm use
-npm install --global pnpm@12.21.0
-```
-
-Si utilizas otro gestor de Node, selecciona igualmente la versión de `.nvmrc`.
-La imagen Docker contiene su propio runtime; el equipo evaluador solo necesita
-Docker y Compose.
-
-Si ya arrancaste todo mediante Compose, detén antes API y worker para liberar
-los puertos de los procesos que ejecutarás en el host:
-
-```bash
-docker compose stop api worker
-```
-
-```bash
-cp .env.example .env
-pnpm install --frozen-lockfile
-docker compose up --wait postgres rabbitmq
-pnpm dev:api
-```
-
-En otra terminal, desde el mismo directorio y con la versión de Node seleccionada:
-
-```bash
-RELAY_ENABLED=true pnpm dev:worker
-```
-
-Los dos comandos observan los cambios y ejecutan TypeScript mediante el soporte
-nativo estable de Node. La compilación para la imagen genera JavaScript:
-
-```bash
-pnpm build
-pnpm typecheck
-pnpm test
-pnpm check:connections
-```
-
-Las pruebas de integración requieren una base de pruebas aislada, nunca una base
-con datos que se deban conservar. Un ejemplo con un proyecto y puerto propios:
-
-```bash
-POSTGRES_PORT=55434 RABBITMQ_PORT=5684 docker compose -p agenda-tests up --wait postgres rabbitmq
-COMPOSE_PROJECT_NAME=agenda-tests node scripts/verify-rabbitmq.mjs
-TEST_DATABASE_URL=postgresql://diagnostic:diagnostic_dev@127.0.0.1:55434/diagnostic_appointments TEST_RABBITMQ_URL=amqp://diagnostic:diagnostic_dev@127.0.0.1:5684 pnpm test:integration
-```
-
-`pnpm test` ejecuta las reglas puras; `pnpm test:integration` comprueba el contrato
-HTTP con Fastify `inject`, PostgreSQL y RabbitMQ reales. La E2E arranca dos APIs
-y dos workers, usa HTTP de red y crea una base sintética por ejecución; requiere
-que el usuario de pruebas pueda crear bases. Estas bases se conservan como
-artefactos locales. El caso completo de reintentos espera los 155 segundos de
-backoff acordados, además de ejecución y transporte. El traslado del broker con
-DLQ reparada puede esperar el temporizador interno de RabbitMQ 4.4 de 180 segundos;
-la prueba deja esa configuración intacta. La CI arranca los servicios con Compose después del checkout
-para montar las definiciones versionadas del broker y comprobarlas antes de probar.
-Las consultas se comprueban también
-con una conexión de solo lectura. La concurrencia arranca dos procesos Node con
-pools propios y usa una conexión controladora que retiene el ámbito; un observador
-verifica esperas reales y sus cadenas con `pg_stat_activity`/`pg_blocking_pids`
-antes de soltarlo. Cubre tres pacientes competidores, ámbitos independientes,
-misma clave entre instancias, respuesta no leída y cruce del inicio durante la
-espera. Las transiciones añaden carreras de confirmación/cancelación/barrido,
-cruce real del vencimiento tras la barrera y un orden forzado donde el worker
-vence primero. La lista añade ambos órdenes de alta/directa y alta/liberación,
-claves iguales/distintas entre procesos y cruce del vencimiento del bloqueo
-propio con capacidad directa o prioridad previa de otro paciente. El consumidor
-permanece detenido: GET y POST siguen respetando la prioridad. Las fronteras exactas de igualdad y 1 ms se comprueban en reglas
-puras con tiempo explícito, sin atribuir fake timers de JavaScript a PostgreSQL.
-Los fallos SQL por permisos en la escritura final del resultado o de outbox
-acreditan rollback completo y permiten reintentar. El usuario SQL de esta base
-aislada debe poder crear/eliminar roles temporales y crear bases de pruebas.
-La prueba del worker arranca API y worker sobre otra base vacía, usa un TTL
-acortado, conserva la liberación con AMQP inaccesible y comprueba retención de la
-outbox al reiniciar el worker.
-También comprueba reinicialización, rechazo de solapamientos, restricciones,
-titularidad sintética, plazos, replay, lectura conservadora, unicidad con ocupante
-vencido y clasificación de fallos. `pnpm typecheck` comprueba
-aplicación, pruebas y configuración con TypeScript estricto; `pnpm build` genera
-la aplicación. CI ejecuta esos mismos comandos con PostgreSQL real. No hay lint ni
-formato automáticos configurados, ni se atribuye a `inject` cobertura de red E2E.
-
-`offer-decisions.test.ts` recorre rechazo y retirada por HTTP, FIFO/exclusiones,
-repeticiones, causas terminales y rollback ante fallo SQL de outbox. La regresión
-H1/H2 usa relay y consumidores reales, acredita que la revisión de H2 terminó
-antes del rechazo y conserva un caso base sin otro activador. Sus variantes
-añaden un prefijo excluido, duplicados concurrentes, caída de API tras commit,
-H1 reocupado y H1 iniciado. Las carreras con aceptación y barrido periódico usan
-dos procesos API, pools propios y barreras SQL observadas antes de liberarlas.
-
-Si utilizas VS Code mediante SSH, reenvía el puerto 3000 desde la ventana remota
-para acceder a la API desde el navegador del portátil.
-
-## Configuración y datos
-
-`.env.example` documenta las conexiones del modo local. Compose configura sus
-conexiones internas mediante los nombres `postgres` y `rabbitmq`.
-
-| Variable | Uso |
-| --- | --- |
-| `DATABASE_URL` | Conexión PostgreSQL de API y worker |
-| `RABBITMQ_URL` | Conexión AMQP del worker y de la comprobación de conexiones |
-| `HOST` | Dirección de escucha; `127.0.0.1` local y `0.0.0.0` dentro del contenedor |
-| `API_PORT` | Puerto de la API; 3000 por defecto |
-| `WORKER_HEALTH_PORT` | Comprobaciones del worker local; 3001 por defecto |
-| `DIRECT_HOLD_TTL_MS` | TTL de bloqueo de la API; 600000 por defecto, entre 1 y 600000 ms |
-| `EXPIRY_SWEEP_INTERVAL_MS` | Intervalo positivo de barrido del worker; 3000 ms por defecto |
-| `OUTBOX_RETRY_DELAY_MS` | Espera positiva de transporte por publicación fallida o incierta; 5000 ms por defecto |
-| `PUBLISHER_CONFIRM_TIMEOUT_MS` | Plazo positivo para resolver confirmación, devolución y contrapresión; 5000 ms por defecto |
-| `POSTGRES_PORT`, `RABBITMQ_PORT` | Puertos publicados por Compose; 5432 y 5672 por defecto |
-
-Si cambias un puerto publicado de PostgreSQL o RabbitMQ, ajusta también la URL
-correspondiente del modo local. Los servicios de Compose conservan sus puertos
-internos. La API de Compose escucha internamente en 3000.
-
-PostgreSQL conserva su volumen entre arranques. `db/schema.sql` define hospitales,
-tipos, recursos, pacientes sintéticos, ámbitos, huecos, reservas, resultados de
-creación, causas de cierre, eventos y publicaciones de outbox, con claves que
-impiden mezclar ámbitos y restricciones que exigen intervalos no vacíos,
-milisegundos y un ocupante por hueco.
-API y worker ejecutan esquema y seed en una transacción de inicialización
-coordinada, validan automáticamente la agenda completa y solo después sirven
-negocio o ejecutan el barrido.
-Una agenda solapada de un mismo recurso impide arrancar la API. El worker exige
-la marca de validación para anunciar disponibilidad. RabbitMQ tiene su propio
-volumen y un nombre de nodo estable.
-
-El seed contiene cinco huecos en tres ámbitos, cuatro recursos y tres pacientes
-(`patient-ana`, `patient-bruno`, `patient-carlos`). El primer arranque fija el
-ancla al día siguiente a las 09:00 UTC en `scheduling.demo_seed`; los arranques
-posteriores insertan solo las filas ausentes usando esa misma ancla y nunca
-desplazan fechas existentes. Los huecos contiguos y simultáneos de recursos
-distintos son válidos. El dataset queda por debajo de veinte futuros por ámbito;
-ese límite no restringe el endpoint. Tras pasar sus fechas, la agenda deja de
-tener huecos futuros: para otra demostración se requiere la recreación explícita
-del entorno sintético, no un reinicio normal.
-
-Los scripts SQL de PostgreSQL se ejecutan sobre un volumen vacío; además API y worker
-los aplican de forma idempotente antes de servir. No se ofrecen migraciones de
-bases pobladas. Para recrear explícitamente toda la demo, el siguiente
-comando elimina los volúmenes y sus datos locales:
-
-```bash
-docker compose down --volumes
-docker compose up --build --wait
-```
-
-Para detenerlo conservando los datos:
-
-```bash
-docker compose down
-```
-
-## Decisiones y alternativas
-
-| Elección | Versión | Motivo |
+| Método y ruta | Entrada | Resultado |
 | --- | --- | --- |
-| Node.js | 26.13.1 LTS | Runtime mantenido y soporte nativo de TypeScript para desarrollo |
-| TypeScript | 6.0.3 | Versión estable mantenida y compatible con la preparación de calidad prevista |
-| pnpm | 12.21.0 | Versión y lockfile fijados |
-| Fastify | 5.12.8 | HTTP directo con composición explícita y política LTS |
-| PostgreSQL | 18.7 | Transacciones y restricciones para exclusividad e idempotencia |
-| `pg` | 8.23.1 | SQL y cliente transaccional explícitos, sin ORM |
-| RabbitMQ | 4.4.0 | Broker independiente de la base de datos, con soporte comunitario vigente |
-| `amqplib` | 2.3.1 | Control directo de conexiones, confirmaciones y acuses AMQP |
-| Vitest | 5.1.0 | Pruebas de reglas puras, contrato HTTP e integración SQL |
+| `GET /slots` | `hospitalId`, `testTypeId`, `from`, `to` | `200`, agenda pública futura y `directlyBookable` |
+| `POST /slots/:slotId/holds` | Cabeceras paciente y clave; sin cuerpo | `201`, reserva `HELD` |
+| `GET /reservations/:id` | Cabecera paciente | `200`, reserva propia, tiempo y acciones |
+| `POST /reservations/:id/confirm` | Cabecera paciente; sin cuerpo | `200`, misma reserva `CONFIRMED`; también acepta ofertas |
+| `POST /reservations/:id/cancel` | Cabecera paciente; sin cuerpo | `200`, bloqueo o cita cancelada |
+| `POST /reservations/:id/reject` | Cabecera paciente; sin cuerpo | `200`, rechazo de oferta vigente |
+| `POST /waiting-list-entries` | Paciente, clave, JSON hospital/tipo | `201` nueva inscripción; `200` activa existente |
+| `GET /waiting-list-entries/:id` | Cabecera paciente | `200`, inscripción propia y oferta si existe |
+| `POST /waiting-list-entries/:id/withdraw` | Cabecera paciente; sin cuerpo | `200`, retirada o causa real de cierre anterior |
 
-Usamos LTS cuando existe y versiones estables soportadas en el resto. RabbitMQ
-distingue soporte comunitario y soporte prolongado comercial; no se presupone una
-licencia comercial. Las imágenes y dependencias se fijan para reproducir el entorno.
+`X-Patient-Id` presenta una de las tres identidades sintéticas. **Es falsificable**:
+las comprobaciones de titularidad usan la identidad presentada; no autentican ni
+impiden suplantación. Una reserva/inscripción ajena o inexistente da el mismo
+`404 NOT_FOUND`. Campos, cabeceras o pacientes inválidos dan `400`; fallos
+transitorios identificables de PostgreSQL dan `503 DEPENDENCY_UNAVAILABLE` y
+otros errores internos `500 INTERNAL_ERROR`.
 
-Un único paquete TypeScript contiene dos puntos de entrada y produce una imagen
-común. API y worker se ejecutan por separado. Frente al workspace de pnpm, esta
-opción reduce la configuración inicial y mantiene los módulos dentro del mismo
-paquete. La separación de responsabilidades permitirá extraer paquetes cuando
-exista una necesidad concreta.
+La consulta de agenda selecciona inicios en `[from,to)` estrictamente futuros,
+ordenados por inicio/ID; un ámbito desconocido devuelve lista vacía. Exige zona
+u offset y como máximo tres decimales, y devuelve UTC con milisegundos. Los GET
+son de solo lectura: distinguen estado guardado, `evaluatedAt`, `temporal.expired`,
+`closurePending` y `actions`. Un temporal vencido pendiente de cierre sigue
+ocupando conservadoramente; no aparece confirmable. Una cita confirmada no
+caduca por su antiguo plazo. La información de disponibilidad no reserva capacidad.
 
-```text
-src/
-├── bootstrap/                     Composición y ciclo de vida de cada proceso
-├── config/                        Lectura de configuración por proceso
-└── scheduling/
-    ├── domain/                    Reglas puras de agenda, plazos y evaluación
-    ├── application/               Casos de uso y puerto transaccional de citación
-    └── adapters/
-        ├── http/                  Contrato HTTP e identidad sintética
-        ├── postgres/              Coordinación, persistencia y reloj autoritativo
-        └── rabbitmq/              Topología, publicación confirmada y consumo AMQP
-```
+### Reservas y lista de espera
 
-Las reglas no importan HTTP, SQL ni AMQP. Los casos de uso acceden a un único
-puerto de citación con un callback transaccional y operaciones concretas; el
-cliente `pg` permanece dentro del adaptador. Se evita un mutex en memoria, que
-no coordinaría instancias, y repositorios CRUD genéricos, que ocultarían la
-atomicidad necesaria. Los bloqueos pesimistas del ámbito simplifican este
-ejercicio frente a detectar conflictos de varias escrituras al final.
+- Un bloqueo vence al menor de creación + diez minutos e inicio del hueco; el
+  TTL se puede acortar. Una oferta vence al menor de creación + máximo configurado
+  (dos horas por defecto) e inicio. En igualdad ya ha vencido. Ningún temporal
+  se crea con ventana vacía; las escrituras revalidan tiempo después de esperar.
+- Confirmar conserva el ID. Una confirmación repetida da `200` mientras siga
+  confirmada; después de cancelarla da `409` con ese ID/estado actual. Una
+  petición sobre R1 no altera la R2 que ocupe después el mismo hueco.
+- Cancelar una cita nueva exige tiempo anterior al inicio; en igualdad devuelve
+  `409 APPOINTMENT_STARTED`. Cancelar un hold vencido materializa `EXPIRED` y
+  devuelve `409 RESERVATION_EXPIRED`. Una cancelación completada se puede repetir
+  sin nuevos efectos, incluso pasado el inicio.
+- El alta recupera primero un éxito de la clave. Para una intención nueva
+  normaliza vencimientos y devuelve una inscripción realmente activa si existe.
+  Solo al admitir una nueva aplica Q24: un `HELD` propio vigente del mismo ámbito
+  da `409 ACTIVE_HOLD_IN_SCOPE`. Después Q2 informa capacidad directa mediante
+  `409 DIRECT_CAPACITY_AVAILABLE` y referencias públicas de huecos. No crea
+  inscripción ni éxito de alta, y conserva los cierres/liberaciones ya decididos.
+- Un hold en otro ámbito no activa Q24. Tampoco una cita confirmada. Se permite
+  coexistencia entre hold e inscripción: una inscripción existente se recupera
+  antes de Q24 y un replay histórico no evalúa una admisión nueva. Ana puede
+  confirmar un hold, inscribirse, cancelar y recibir otra reserva del mismo hueco.
+- La espera es por hospital/tipo, compartida entre recursos equivalentes. FIFO
+  usa un entero persistido creciente, incluso con timestamps empatados. Cada
+  inscripción recibe como máximo una oferta pendiente. Los huecos se recorren
+  por inicio/ID; para cada uno se elige la primera inscripción elegible. Se acepta
+  que las exclusiones dejen capacidad libre frente a un matching global óptimo.
+- Rechazar a tiempo cancela esa oferta, excluye ese hueco y conserva inscripción y
+  antigüedad. Un único `SlotReleased` reactiva todo el ámbito, incluido otro hueco
+  ya libre. Repetir el rechazo no altera una oferta posterior. Rechazar al vencer
+  cierra por caducidad con conflicto, sin devolver la inscripción a espera.
+- Retirarse cancela una oferta vigente y cierra su inscripción atómicamente.
+  Una retirada tardía devuelve la causa real de cierre, sin afectar una cita ni
+  una reinscripción posterior. Una oferta no aceptada cierra su inscripción por
+  `EXPIRED`; reincorporarse necesita otra clave/ID y va al final si procede.
+- El worker barre temporales, incluidos atrasados durante una parada. La prioridad
+  de espera se deriva de estado/exclusiones en PostgreSQL: ni un consumidor parado
+  permite adelantar a un paciente elegible mediante hold directo.
 
-## Ofertas y mensajería implementadas
+### Reintentos HTTP
 
-El relay del worker publica una sola fila a la vez con mensajes persistentes,
-`mandatory` y confirmación del broker. Una devolución sin ruta es fallo aunque
-haya confirm positivo; el booleano de `publish` solo regula contrapresión.
-`published_at` acredita publicación confirmada con ruta, no consumo ni aviso.
-Una caída tras aceptación del broker y antes de guardar esa fecha puede duplicar.
+Las dos creaciones exigen `Idempotency-Key`. Guarda la clave antes del primer
+intento. Mismo paciente, operación, clave y destino recuperan cuerpo y código
+originales (`201` o `200`), aunque el recurso haya cambiado, sin nuevo recurso,
+evento ni plazo. GET permite conocer el estado actual tras ese replay histórico.
+Reutilizar una clave exitosa con otro destino da `409 IDEMPOTENCY_KEY_REUSED`.
+Pacientes y operaciones separan claves. Un conflicto sin éxito se reevalúa y un
+fallo técnico revierte las escrituras; no se cachean indiscriminadamente errores.
+Las transiciones sin clave son idempotentes respecto a sus efectos y estado actual.
 
-Cada envío registra antes de tocar la red `send_count`, `last_attempt_at` y una
-fecha conservadora `next_attempt_at`; una caída incierta también conserva esa
-espera. Un fallo guarda `last_error` y programa desde su detección una espera
-positiva `OUTBOX_RETRY_DELAY_MS`. La fecha lógica `available_at` no cambia. Solo
-se eligen pendientes cuyo máximo de fechas lógica y de transporte haya llegado,
-respetando además `consumer_attempts.not_before` cuando ya existe; el orden total
-es fecha efectiva, creación e ID. No se purgan pendientes tras un número de envíos
-ni se gastan con ellos los intentos del consumidor. La evidencia publicada y el
-último error se retienen, y una publicación ya completada no vuelve a seleccionarse.
+## Persistencia, concurrencia y mensajería
 
-Una devolución sin ruta resuelta con confirmación conserva el canal y permite
-enviar otra publicación lista antes de reparar el binding. Un timeout, nack,
-error o cierre deja resultado incierto, retira esa generación de conexión y
-reconstruye canales y topología. La espera máxima de confirmación y contrapresión
-es `PUBLISHER_CONFIRM_TIMEOUT_MS`; el cierre espera como máximo 500 ms antes de
-abortar su socket. Las respuestas antiguas pertenecen a canales retirados. Si
-falla toda la conexión, se espera un segundo entre conexiones, además del tiempo
-de conexión; solo se exige avance independiente con broker y otra ruta operativos.
-Esto no ofrece un plazo máximo de entrega.
+PostgreSQL usa transacciones `READ COMMITTED`, coordinación técnica de clave o
+evento/consumidor y, como primer bloqueo de negocio, la fila estable del ámbito.
+Después de esperar hace lecturas nuevas y toma
+`date_trunc('milliseconds', clock_timestamp())`. Índices parciales aseguran un
+ocupante `HELD/OFFERED/CONFIRMED` por hueco, una inscripción activa por paciente y
+ámbito y una oferta por inscripción. No se usa un mutex de proceso. Ámbitos
+distintos pueden avanzar independientemente; dentro del ámbito se serializan
+escrituras cortas, sin esperar al paciente ni al broker. Lock timeout: 2 s;
+statement timeout: 2,5 s. No son un SLO de respuesta.
 
-Cada entrega lleva versión, evento, consumidor lógico, ciclo, intento y publicación
-separados. El consumidor coordina la pareja evento/consumidor en PostgreSQL antes
-del ámbito. Guarda efectos, resultado por ciclo/intento y siguientes eventos en
-un mismo commit, y solo entonces hace ack manual. El resultado terminal protege
-frente a publicaciones/reentregas repetidas y a intentos antiguos. No ordena por
-la llegada al broker: una revisión adquiere el ámbito, relee estado/tiempo, cierra
-los temporales pertinentes y recorre todos los huecos libres futuros por inicio/ID.
-Cada hueco obtiene la primera inscripción elegible FIFO; avanza tras exclusiones
-o ausencia de candidato, aunque el origen esté reocupado o iniciado. No toca una
-reserva sustituta ni usa matching global o cursores.
+Negocio y eventos/outbox se comprometen juntos. `SlotReleased` y
+`AllocationReviewRequested` revisan el ámbito vigente; `OfferCreated` avisa de
+una oferta concreta ya creada. Los mensajes tienen versión e identidades
+separadas de evento, consumidor lógico, ciclo, intento y publicación.
 
-La oferta `OFFERED`, su vínculo a la inscripción y `OfferCreated` con outbox se
-comprometen juntos. Dos índices parciales garantizan un ocupante por hueco y una
-oferta por inscripción. Su plazo es `min(creación + OFFER_MAXIMUM_MS, inicio)`,
-con máximo configurable positivo y dos horas por defecto. Confirmarla por
-`POST /reservations/ID/confirm` conserva ID y cierra la inscripción con `ACCEPTED`;
-una aceptación tardía cierra por caducidad, libera y devuelve conflicto.
+| Situación | Comportamiento y límite |
+| --- | --- |
+| Broker inaccesible | Negocio y outbox permanecen en PostgreSQL; barrido sigue; el relay recupera pendientes al volver. |
+| Publicación sin ruta | `mandatory` + confirm detectan fallo; se retiene error y próxima fecha positiva. Otra ruta operativa puede avanzar. |
+| Confirmación incierta | Se retira la conexión y se reintenta; broker pudo aceptar antes de perder la respuesta. `published_at` no acredita consumo. |
+| Duplicado o caída tras commit/preack | Resultado terminal por evento/consumidor evita una segunda adjudicación; puede repetirse transporte o log. |
+| Mensaje antiguo/desordenado | Relee estado y plazo bajo coordinación; no libera ni cambia la reserva sustituta. FIFO no depende del orden AMQP. |
+| Fallo lógico transitorio | Rollback y programación SQL durable de reintentos a 5 s, 30 s y 120 s desde el fallo anterior; cuatro intentos por ciclo. |
+| Fallo permanente o cuarto fallo | Aparcado SQL y outbox hacia DLQ antes del ack; no se registra éxito del negocio. |
+| Caída general de BD o salida de logs rota | Pausa limitada con espera y `prefetch=1`, sin gastar presupuestos lógicos en masa. |
+| Pérdida física comprobada | Recuperación explícita de una publicación retenida; nunca reproducción indiscriminada de toda la outbox publicada. |
 
-El aviso relee la reserva concreta inmediatamente antes de escribir. Solo emite
-si aún es `OFFERED` vigente; omite una reserva confirmada/cancelada/vencida y nunca
-busca una sustituta. El log JSON contiene `eventId`, `reservationId`, `slotId`,
-referencia sintética `patientId` y `expiresAt` persistido. Espera el callback de
-escritura o su error antes del resultado SQL y del ack, sin bloquear el ámbito.
-Puede repetirse tras una caída entre escribir y registrar, o aparecer tarde si
-vence después de comprobarla. No acredita recepción humana, vigencia al leerlo
-ni captura durable por la plataforma. Aceptar siempre revalida.
+El relay único está habilitado **por configuración**, sin elección de líder ni
+relevo automático. Cada envío conserva contador, error y próxima fecha durable;
+la selección respeta tanto esa fecha como la del intento lógico. No purga por
+número de envíos. Espera de conexión: un segundo; timeout de confirmación y
+contrapresión configurable. El cierre retira conexiones inciertas de forma acotada.
 
-Un fallo específico transitorio revierte primero el negocio. Después, otra
-transacción adquiere la misma coordinación evento/consumidor y revalida el resultado
-terminal, ciclo vigente e intento: otra entrega pudo ganar durante el rollback.
-Si sigue pendiente, guarda el error y el intento fallido junto con el siguiente
-intento y su publicación outbox. Las esperas son 5 s, 30 s y 120 s desde el fallo
-anterior, con cuatro intentos como máximo por ciclo. `not_before` y `available_at`
-conservan esa espera tras reiniciar; un mensaje adelantado no puede ejecutarla.
-Una copia del intento fallido, incluso con otro ID de publicación, reconoce lo
-ya guardado sin ejecutar de nuevo, adelantar fechas ni duplicar presupuesto.
+RabbitMQ conserva dos colas de trabajo quorum y sus dos DLQ, exchanges/bindings
+versionados y mensajes persistentes. Las principales usan `delivery-limit=20`,
+DLX `at-least-once` y `overflow=reject-publish`. El límite físico protege caídas
+anteriores a evidencia SQL; **no equivale al presupuesto lógico**. Las DLQ no
+tienen TTL, DLX, retorno automático ni límite de entregas fallidas. Si falta su
+ruta, el broker conserva el traslado; su temporizador interno puede demorar la
+reparación (180 s por defecto en la versión fijada). Ninguna espera garantiza un
+plazo máximo de entrega. Un miembro quorum y un relay configurado **no son HA**.
 
-El cuarto fallo o un error permanente de contrato/referencia aparcan el ciclo.
-La publicación a `appointments.dead` y su ruta propia se guarda en outbox antes
-del ack original; aparcar no guarda éxito del negocio. Un destino sin ruta deja
-esa publicación pendiente con la misma recuperación del relay. Si falla la BD
-durante la recuperación, no hay ack. Ante commit incierto se consulta de nuevo
-la evidencia bajo coordinación; si tampoco puede comprobarse, la reentrega
-posterior resuelve el resultado sin repetir una planificación comprometida.
+El aviso comprueba inmediatamente antes de escribir que la reserva concreta sigue
+`OFFERED` y vigente. Espera la escritura/callback antes de guardar resultado y ack,
+sin bloquear el ámbito. Incluye evento, reserva, hueco, referencia sintética de
+paciente y vencimiento persistido. Puede repetirse tras escribir y caer, o llegar
+tarde si vence/se rechaza entre comprobación y emisión. No acredita captura durable
+del log ni recepción humana. Aceptar vuelve a validar estado y plazo. **Una oferta
+puede vencer sin que haya existido un aviso utilizable**; el plazo nace al crearla.
+No se interpreta como recepción ni desinterés del paciente.
 
-Un aviso ya inválido termina con descarte sin gastar el resto del presupuesto.
-Errores de conexión/indisponibilidad global de PostgreSQL y un destino de logs
-roto (`EPIPE`, stream destruido o terminado) conservan el mensaje sin gastar
-intentos. Cada consumidor tiene `prefetch=1` y espera un segundo antes de un
-`nack` de pausa; en RabbitMQ 4.4 ese `nack` no aumenta fallos físicos. Los conflictos
-SQL transitorios de una operación y los fallos específicos de escritura sí pasan
-por la programación lógica. Errores sin recuperación SQL demostrable conservan
-la entrega; las caídas del proceso siguen protegidas por el límite físico.
+## Recuperación manual
 
-`rabbitmq/definitions.json` y `rabbitmq/rabbitmq.conf` aprovisionan desde vacío
-usuario/credencial ficticios, exchanges, bindings y cuatro colas quorum durables:
-`appointments.allocation`, `appointments.notifications` y sus dos `.dlq`. Las
-principales tienen `delivery-limit=20`, DLX `at-least-once`, rutas específicas y
-`overflow=reject-publish`. Las DLQ desactivan su propio límite físico, usan
-`reject-publish` y no tienen TTL, DLX ni retorno automático. El verificador lee
-argumentos, política efectiva, bindings, operator policies y flags reales.
-En RabbitMQ 4.4, `basic.reject(requeue=true)` incrementa fallos físicos; se observan
-contadores 0…20 y el siguiente fallo supera el límite. No equivale a veinte
-adquisiciones totales ni al presupuesto lógico de cuatro intentos.
-Si falta la ruta DLQ, el broker retiene el traslado aunque los contadores de
-mensajes listos estén a cero. Recuperarla puede esperar hasta su siguiente
-reintento interno: RabbitMQ 4.4 usa por defecto 180 segundos en
-[`dead_letter_worker_publisher_confirm_timeout`](https://github.com/rabbitmq/rabbitmq-server/blob/v4.4.0/deps/rabbit/Makefile#L113-L114).
-Es un temporizador del traslado del broker, independiente de las esperas SQL y
-del envío del relay; ninguna de esas cifras promete un plazo máximo de entrega.
-
-Compose arranca un solo worker con `RELAY_ENABLED=true` por defecto. En ejecución
-Node el valor predeterminado es `false`; habilitarlo explícitamente en W1 y dejar
-`false` en W2 y demás réplicas. Todos consumen con ack manual y `prefetch=1` por
-consumidor. W2 no publica ni sustituye al relay caído; un miembro local quorum y
-un relay configurado no aportan alta disponibilidad. Para proyectos paralelos,
-usar puertos/volúmenes distintos y `APPLICATION_IMAGE=appointment-task:local`,
-que evita compartir la etiqueta de imagen entre builds de tareas distintas.
-
-El recorrido reproducible automatizado está en `async-offers-e2e.test.ts`: consultar
-el único H de south/mri → Carlos bloquea → Ana/Bruno esperan por orden mientras
-R1 sigue vigente → W2 barre sin publicar → W1 publica → observar aviso real →
-Ana acepta R2. Verifica R1 `EXPIRED`, solo R2 `CONFIRMED` y Bruno `WAITING`.
-Después cancela la cita confirmada y observa oferta/aceptación de Bruno. Las
-pruebas adicionales usan dos procesos consumidores con barreras SQL, caída entre
-commit/ack, devolución mandatory real, desorden, exclusiones, rollback y fallos
-de escritura. Para el recorrido manual puede reducirse `DIRECT_HOLD_TTL_MS` en
-Compose y seguir `docker compose logs --follow worker` para obtener la oferta;
-los GET propios y el endpoint de confirmación completan la aceptación.
-
-`relay-recovery.test.ts` prueba con PostgreSQL y RabbitMQ reales que P2 se publica
-mientras P1 sigue sin binding, que P1 conserva fecha e identidades tras reiniciar
-el relay y que W2 no toma su papel. Un proxy TCP de prueba retiene respuestas
-reales para forzar timeout y comprobar la retirada de la conexión antigua; no
-fabrica callbacks de confirmación. También cubre selección temporal, desempate y
-más de cuatro fallos de transporte sin consumir intentos lógicos. La prueba de
-caída tras confirmación usa el mismo paso de relay que el worker y comprueba
-republicación física con un solo efecto SQL.
-
-La prueba `offer-expiry-e2e.test.ts` retrasa el trabajo de aviso de Ana en
-la outbox de una base sintética, sin cambiar la creación normal de ofertas.
-El worker cierra su oferta al vencer, el consumidor descarta después el aviso
-antiguo y la aceptación por HTTP devuelve conflicto. Con hueco futuro, Bruno
-recibe un aviso realmente escrito y acepta su propia reserva; si el vencimiento
-coincide con el inicio, permanece esperando. El plazo nace al crear la oferta:
-puede vencer sin un aviso utilizable y eso no acredita recepción, desinterés ni
-una ventana efectiva para responder. En un entorno real habría que acordar esa
-política con el hospital.
-
-Las pruebas de reinscripción mantienen separados los casos con prioridad ajena,
-capacidad directa y bloqueo propio vigente, con barrido detenido o ya ejecutado.
-Comprueban claves históricas y nuevas, GET con conexión de solo lectura, un fallo
-diferido al commit y dos APIs que cruzan el vencimiento mientras esperan
-coordinación; no atribuyen el reloj de PostgreSQL a temporizadores JavaScript.
-
-Las pruebas de reintentos usan PostgreSQL y RabbitMQ reales, dos procesos con
-barreras observadas y un proxy TCP que pierde confirmaciones de commit o retiene
-la respuesta de rollback para dejar ganar a otra entrega. El ciclo completo espera
-5 s, 30 s y 120 s reales; reinicia el consumidor tras registrar el primer fallo
-y antes del ack. También comprueba caída repetida antes de cualquier registro SQL,
-aparcado de aplicación con ruta DLQ rota y traslado del broker con destino sin
-ruta. Estos experimentos distinguen siempre intentos SQL de envíos y fallos AMQP.
-
-## Recuperación manual de trabajo aparcado
-
-Tras diagnosticar y corregir la causa, el operador selecciona una publicación
-concreta. La herramienta conserva el evento y consumidor, registra la decisión
-y crea el intento cero de un ciclo nuevo junto con su publicación pendiente.
-Los consumidores normales aplican otra vez el presupuesto de cuatro intentos
-y esperas de 5 s, 30 s y 120 s. Ni el contenido del evento ni los plazos de reservas
-existentes cambian. El aviso vencido termina descartado; una revisión sigue
-examinando el ámbito vigente aunque su hueco de origen esté ocupado o iniciado.
-
-Para identificar candidatos mediante evidencia técnica retenida, sin leer datos
-de pacientes:
+Diagnostica y corrige la causa antes de seleccionar una publicación exacta.
+Para localizar candidatos sin consultar payloads de pacientes:
 
 ```bash
 docker compose exec -T postgres psql -U diagnostic -d diagnostic_appointments -c "
@@ -794,12 +247,8 @@ WHERE p.destination='dead' OR c.state='parked'
 ORDER BY p.created_at, p.id;"
 ```
 
-Esta consulta muestra candidatos, no acredita por sí sola un mensaje perdido.
-Un aparcado físico puede no tener aún resultado ni fallo SQL. En el modo DLQ se
-verifica la ruta de la entrega, su identidad y publicación retenida. El origen
-físico exige `x-death` por `delivery_limit` de su cola de trabajo; el origen de
-aplicación exige una publicación `dead` del ciclo aparcado. Sustituye el UUID
-ficticio por el `publication_id` exacto y el consumidor correspondiente:
+Son candidatos técnicos; la consulta no demuestra por sí sola pérdida física.
+Sustituye el UUID ficticio por el `publication_id` exacto y el consumidor:
 
 ```bash
 docker compose exec -T worker node dist/bootstrap/recover-message.js \
@@ -808,94 +257,181 @@ docker compose exec -T worker node dist/bootstrap/recover-message.js \
   --operator demo-operator --reason 'Causa sintética corregida y verificada'
 ```
 
-La búsqueda inspecciona como máximo 100 mensajes listos de esa DLQ; puede usarse
-`--scan-limit` entre 1 y 1000. Mantiene sin reconocer los mensajes no seleccionados
-y los devuelve al cerrar su canal. La selección puede fallar si el mensaje está
-en poder de otro operador, todavía no está listo o queda fuera del límite; no
-repite indefinidamente ni purga la cola. El cierre y las reentregas pueden cambiar
-el orden físico de la DLQ, sin alterar el FIFO de inscripciones del negocio.
-Los envelopes desconocidos o con procedencia incompatible permanecen para
-diagnóstico, sin descarte automático.
+Busca hasta 100 entregas listas (`--scan-limit` permite 1..1000). Verifica envelope,
+ruta, publicación retenida y origen físico `delivery_limit` o aparcado de aplicación.
+No reconoce otras entregas; se reencolan al cerrar el canal. Puede no encontrar
+una entrega ocupada, no lista o fuera del límite, y la búsqueda puede alterar el
+orden físico de DLQ. No cambia FIFO de pacientes. Desconocidos permanecen para
+diagnóstico. Fallar produce `manual_recovery_failed` y salida distinta de cero,
+conservando el original. Usa conexión dedicada; cierra canal hasta 500 ms y, si
+es incierto, retira la conexión con otro límite de 500 ms.
 
-La operación usa una conexión dedicada y poseída. Espera como máximo 500 ms la
-confirmación de cierre del canal; ante error o respuesta retenida retira toda esa
-conexión mediante su cierre acotado a otros 500 ms y `AbortSignal`. No reutiliza
-esa generación. Un corte después del commit y antes del ack conserva la entrega
-reentregada y reconoce el mismo ciclo, sin repetir la recuperación SQL.
-
-Si se ha comprobado que falta el mensaje físico, se puede elegir expresamente
-el modo por evidencia persistida. Exige la publicación exacta, operador y motivo;
-admite una publicación de aparcado con su ciclo SQL o una publicación de trabajo
-con evidencia retenida de envío confirmado o intentado. Una publicación de
-trabajo nunca enviada sigue a cargo del relay y se rechaza. Este modo no conecta
-con RabbitMQ y permite registrar la recuperación mientras está caído:
+Si se ha comprobado ausencia del mensaje físico, el modo persistido usa evidencia
+retenida de aparcado o envío confirmado/intentado y no conecta con RabbitMQ:
 
 ```bash
 docker compose exec -T worker node dist/bootstrap/recover-message.js \
-  --mode persisted \
-  --publication-id 00000000-0000-4000-8000-000000000001 \
-  --operator demo-operator --reason 'Ausencia física comprobada; causa sintética corregida'
+  --mode persisted --publication-id 00000000-0000-4000-8000-000000000001 \
+  --operator demo-operator --reason 'Ausencia física comprobada; causa corregida'
 ```
 
-En ejecución local con Node y `DATABASE_URL`/`RABBITMQ_URL` configurados, la misma
-interfaz está en `pnpm recover:message`. Los operadores y motivos quedan
-persistidos: usar referencias técnicas sintéticas, sin datos de pacientes ni
-credenciales. No existe autenticación de operador en esta herramienta local.
+Trabajo nunca enviado corresponde al relay y se rechaza. La recuperación coordina
+evento/consumidor, conserva historial, contenido y deadlines, y guarda auditoría,
+nuevo ciclo, intento cero y outbox antes del ack. Dos operadores, copias o caída
+tras commit reconocen la misma recuperación. No invalida un intento posterior.
+La salida `manual_recovery` puede indicar `recovered`, `already_completed` o
+`superseded`; estos dos últimos no crean trabajo. Si una entrega DLQ ya se retiró,
+el modo persistido permite consultar la recuperación del mismo ID. Un nuevo ciclo
+aparcado requiere otra selección explícita. La herramienta local no autentica al
+operador: usa motivos/referencias sintéticas, sin secretos ni información clínica.
 
-La salida JSON `manual_recovery` incluye `outcome`, `cycle` y `publicationId`.
-`recovered` identifica el nuevo trabajo o la recuperación anterior reconocida;
-`already_completed` conserva un resultado terminal, y `superseded` indica que
-existe un ciclo o intento posterior. Estos dos últimos no crean publicaciones.
-`manual_recovery_failed` produce salida de error y código distinto de cero; en
-modo DLQ conserva la entrega sin ack. Si la entrega ya fue retirada tras un éxito,
-una repetición DLQ puede no encontrarla; la selección persistida del mismo ID
-permite comprobar la recuperación registrada.
+## Configuración y desarrollo
 
-La pareja evento/consumidor se coordina con el mismo bloqueo global de los
-consumidores, antes de tocar el ámbito de negocio. La recuperación valida el
-ciclo actual y su intento más reciente: una copia antigua del mismo ciclo no
-invalida un retry posterior. Un índice único impide abrir dos ciclos desde el
-mismo ciclo de origen. Se guardan `consumer_recoveries`, nuevo ciclo, intento y
-outbox en una transacción antes del ack. Una caída tras commit, un commit cuya
-respuesta se pierde, dos operadores o copias físicas reconocen esa recuperación.
-Un fallo SQL revierte todo y conserva el original. Si falla el broker, el nuevo
-trabajo conserva su publicación pendiente y las esperas del relay. El historial
-publicado se retiene y no se reproduce en bloque. Recuperar después otro ciclo
-aparcado requiere seleccionar explícitamente su propia publicación.
+Versiones reproducibles: Node 26.13.1, pnpm 12.21.0, TypeScript 6.0.3,
+Fastify 5.12.8, PostgreSQL 18.7 y RabbitMQ 4.4.0. Dockerfile e imágenes de
+Compose, `package.json` y lockfile fijan las versiones utilizadas.
+Para desarrollar en el host, instala Node/pnpm indicados y copia
+`.env.example` a `.env`; son valores ficticios locales. Arranca dependencias:
 
-Las pruebas `manual-recovery.test.ts` usan PostgreSQL y RabbitMQ reales: aparcado
-físico sin fallo SQL, 22 fallos SQL al consumir la propia DLQ sin perder el mensaje,
-dos procesos operadores con barrera observada, un consumidor concurrente,
-`SIGKILL` tras commit y antes del ack, copias de DLQ, pérdida TCP de la respuesta
-de commit y broker inaccesible. También comprueban la continuidad del presupuesto,
-el descarte del aviso vencido, el resultado terminal y la revisión de otro hueco
-con el origen iniciado u ocupado.
+```bash
+docker compose up -d --wait postgres rabbitmq
+pnpm install --frozen-lockfile
+pnpm dev:api
+# In another terminal:
+pnpm dev:worker
+```
 
-## Alcance pendiente
+| Variable | Valor predeterminado / uso |
+| --- | --- |
+| `DATABASE_URL`, `RABBITMQ_URL` | URLs locales de `.env.example`; Compose usa nombres internos de servicios |
+| `HOST` | `127.0.0.1` local; `0.0.0.0` en contenedor |
+| `API_PORT`, `WORKER_HEALTH_PORT` | 3000 y 3001; salud worker solo interna en Compose |
+| `POSTGRES_PORT`, `RABBITMQ_PORT` | Puertos de host Compose: 5432 y 5672 |
+| `DIRECT_HOLD_TTL_MS` | 600000; entero entre 1 y 600000 |
+| `OFFER_MAXIMUM_MS` | 7200000; entero positivo |
+| `EXPIRY_SWEEP_INTERVAL_MS` | 3000; entero positivo |
+| `RELAY_ENABLED` | `false` en Node, `true` en worker de Compose; habilitar exactamente uno |
+| `OUTBOX_RETRY_DELAY_MS` | 5000; entero positivo, transporte independiente de intentos SQL |
+| `PUBLISHER_CONFIRM_TIMEOUT_MS` | 5000; entero positivo |
+| `APPLICATION_IMAGE` | `recoletas-diagnostic-appointments:local`; etiqueta de imagen Compose |
 
-- Consolidación final de documentación y cobertura compartida (#14).
+Para proyectos paralelos, elige nombre, puertos y etiqueta propios. Conserva
+**las mismas variables en cada comando Compose**, incluidos stop/up/down/exec;
+cambiar valores puede recrear contenedores con puertos distintos. Los puertos
+internos de PostgreSQL, AMQP y API siguen siendo 5432, 5672 y 3000. Ajusta las URLs
+del host cuando cambies puertos publicados. El worker local necesita
+`RELAY_ENABLED=true` si debe publicar, y las otras réplicas deben mantenerlo en false.
 
-Los volúmenes y el nombre de nodo conservan estado en reinicios normales. Este
-esquema versionado está destinado al arranque sintético desde vacío; no migra una
-base poblada de una entrega anterior. Conservar una configuración incompatible
-debe diagnosticarse, sin borrar colas/volúmenes automáticamente. La retención no
-es backup y no garantiza recuperación tras pérdida irreversible de los discos.
+### Verificación
+
+Con dependencias disponibles y bases exclusivamente sintéticas:
+
+```bash
+pnpm typecheck
+pnpm test
+TEST_DATABASE_URL=postgresql://diagnostic:diagnostic_dev@127.0.0.1:5432/diagnostic_appointments \
+TEST_RABBITMQ_URL=amqp://diagnostic:diagnostic_dev@127.0.0.1:5672 \
+  pnpm test:integration
+pnpm build
+```
+
+Las integraciones crean fixtures/bases/roles y producen mensajes; no apuntarlas
+a bases externas ni con datos reales. Incluyen esperas reales de 5/30/120 s y del
+traslado DLX, por lo que tardan varios minutos. La CI configurada ejecuta topología,
+typecheck estricto de aplicación/pruebas, unitarias, integraciones y build.
+No hay lint, formateador, umbral de cobertura ni benchmark obligatorios configurados.
+La matriz registra resultados locales ejecutados; el estado remoto de CI se
+consulta por su SHA y no se infiere de esos resultados.
+
+## Reinicio, retención y recreación
+
+Un reinicio normal conserva negocio, fechas, claves HTTP exitosas, eventos,
+outbox pendiente **y publicada**, resultados terminales, intentos, ciclos,
+recuperaciones, mensajes y DLQ. No hay purgas automáticas. PostgreSQL y RabbitMQ
+usan volúmenes y RabbitMQ mantiene su identidad estable de nodo.
+
+```bash
+docker compose stop
+docker compose up -d --wait
+# Remove containers while preserving their volumes:
+docker compose down
+docker compose up -d --wait
+```
+
+El worker retoma pendientes al llegar sus fechas, sin segunda asignación y sin
+republicar filas ya marcadas publicadas. La retención no es backup, no migra un
+esquema incompatible y no protege frente a pérdida irreversible del almacenamiento.
+
+Para **recrear toda la demo sintética**, elimina coordinadamente los dos volúmenes:
+
+```bash
+docker compose down --volumes
+docker compose up --build --wait
+```
+
+Esto destruye toda la evidencia anterior de ese proyecto: negocio, claves,
+deduplicación, outbox, resultados, intentos, recuperaciones, colas y DLQ. No borres
+solo PostgreSQL o solo RabbitMQ: mezclar estados antiguos/nuevos puede perder
+trabajo o deduplicación. Usa el mismo nombre de proyecto y variables al recrear.
+Ningún comando de arranque normal realiza ese borrado. La comprobación de entrega
+lo ejecutó únicamente sobre un proyecto nuevo desechable con datos sintéticos.
+
+## Decisiones y alternativas
+
+Se eligió un servicio pequeño con dos procesos (API y worker), núcleo puro y un
+puerto transaccional específico de citación. Fastify aporta validación/HTTP;
+PostgreSQL, transacciones y restricciones; RabbitMQ, transporte real asíncrono.
+El cliente SQL permanece en el adaptador. Se descartaron repositorios CRUD
+genéricos, jerarquías y capas sin comportamiento que aportar al ejercicio.
+
+Se prefirió bloqueo breve por ámbito y restricciones SQL a mutex en memoria
+(inválido entre procesos) o un protocolo optimista más complejo entre varias
+filas. La exclusividad por hueco depende además de validar que la agenda de un
+mismo recurso no solapa. El seed es deliberadamente pequeño; no se administra por API.
+
+Outbox evita la escritura dual negocio/broker. Entrega al menos una vez con
+deduplicación SQL sustituye una promesa de exactamente una vez extremo a extremo.
+Los reintentos se programan en PostgreSQL frente a colas TTL por cada espera:
+concentra presupuesto, fechas y auditoría junto a los efectos, manteniendo un
+límite físico independiente en RabbitMQ. Se acepta log repetido y tardío con
+revalidación al aceptar. Las alternativas y ambigüedades funcionales se detallan
+en la revisión 5 y los ADR, sin una segunda especificación en este README.
+
+## Fuera de alcance
+
+No hay interfaz gráfica, administración de agendas, integración HIS/EHR, pagos,
+asistencia/realización clínica, notificaciones SMS/email, autenticación real ni
+validación clínica de compatibilidad. Tampoco despliegue productivo, HA, liderazgo
+automático, política clínica de retención, backup/restauración, métricas/SLO o
+pruebas de carga. Se recortan para concentrar el ejercicio en concurrencia,
+tiempo, atomicidad y mensajería verificables. La configuración local, las APIs de
+salud y los logs no equivalen a una operación productiva.
 
 ## Datos de pacientes en un entorno real
 
-Diseñaría el modelo para almacenar la mínima información necesaria y usar
-identificadores de paciente opacos. Separaría los datos clínicos de la citación
-cuando corresponda, aplicaría permisos por función y hospital, conexiones cifradas,
-gestión externa de secretos y auditoría de acceso. Los logs evitarían datos de
-pacientes. La retención, las copias de seguridad y su restauración formarían parte
-del diseño operativo y de las políticas de la organización.
+Propondría recoger la mínima información necesaria, usar referencias opacas y
+separar citación de datos clínicos/contactos. Esas referencias siguen siendo
+potencialmente identificables y deben protegerse. Sustituiría la cabecera por
+autenticación real y autorización por paciente, función y hospital; cifrado en
+tránsito/reposo, secretos externos, auditoría de accesos, logs minimizados y acceso
+restringido a mensajes y evidencias técnicas. Operadores también necesitarían
+autenticación y permisos. Definiría con responsables clínicos, privacidad y
+seguridad las bases de tratamiento, retención, borrado y backup/restauración,
+sin atribuir cumplimiento regulatorio automático a esta demo.
 
 ## Evolución a una red de hospitales
 
-El modelo deberá expresar el hospital, el recurso diagnóstico, sus horarios y la
-zona horaria. Las reglas de exclusividad y autorización tendrán que respetar ese
-ámbito. API y worker podrán replicarse por separado; antes de aumentar réplicas
-será necesario demostrar el comportamiento concurrente de la adjudicación y el
-tratamiento de reentregas. La evolución incluirá capacidad de base de datos,
-observabilidad del retraso del outbox y de las colas, recuperación y despliegues
-compatibles con el estado persistido.
+El modelo ya separa hospitales, tipos, recursos y ámbitos. Revisaría calendarios,
+zonas horarias y compatibilidad clínica, manteniendo coordinación por ámbito y
+la exclusividad en la persistencia. API y consumidores pueden replicarse; el relay
+actual necesita liderazgo automático y pérdida de liderazgo controlada para HA.
+Evaluaría tres miembros de cada cola quorum en nodos con fallos independientes,
+mayoría operativa, PostgreSQL con estrategia de disponibilidad/backup y pruebas
+reales de recuperación. No se propone un broker por hospital por defecto.
+
+Mediría carga, contención por ámbito, retraso de outbox/colas, vencimientos sin
+aviso útil y fallos DLQ antes de decidir escalado o partición. Acordaría con el
+hospital el comienzo del plazo de aceptación y las consecuencias de no recibir
+aviso. Despliegues y migraciones tendrían que ser compatibles con trabajo retenido.
+Son propuestas de evolución, sin promesas de capacidad, disponibilidad o entrega
+humana que las pruebas de esta demo no demuestran.

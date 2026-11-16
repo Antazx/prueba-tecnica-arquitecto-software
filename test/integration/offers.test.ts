@@ -197,6 +197,8 @@ it("uses chronological slot IDs and FIFO regardless of message order, accepting 
   expect((await api.joinWaitingList("patient-ana", scope, "offer-test-ana")).status).toBe(201);
   const bruno = await api.joinWaitingList("patient-bruno", scope, "offer-test-bruno");
   if (!("id" in bruno.body)) throw new Error("Expected entry");
+  await pool.query("UPDATE scheduling.waiting_list_entries SET created_at='2030-01-01T00:00:00.000Z' WHERE hospital_id=$1", [scope.hospitalId]);
+  expect((await pool.query("SELECT count(DISTINCT created_at)::integer AS n FROM scheduling.waiting_list_entries WHERE hospital_id=$1", [scope.hospitalId])).rows[0].n).toBe(1);
   await pool.query("INSERT INTO scheduling.waiting_list_slot_exclusions VALUES ($1,'offer-test-b')", [bruno.body.id]);
   for (const id of holds) await api.cancelReservation("patient-carlos", id);
   const publications = (await pool.query(`SELECT p.* FROM scheduling.outbox_publications p JOIN scheduling.events e ON e.id=p.event_id
@@ -388,5 +390,110 @@ it("retains a publication when its relay dies after broker confirmation and repu
   } finally {
     if (a.child.exitCode === null && a.child.signalCode === null) { const exited = once(a.child, "exit"); a.child.kill("SIGKILL"); await exited; }
     await consumer.stop();
+  }
+}, 15000);
+
+it("preserves a substitute offer when an old expired offer is accepted again", async () => {
+  const { offer } = await offerToAna();
+  expect((await api.joinWaitingList("patient-bruno", scope, "offer-test-next")).status).toBe(201);
+  await pool.query("UPDATE scheduling.reservations SET created_at=created_at-interval '3 hours',expires_at=expires_at-interval '3 hours' WHERE id=$1", [offer.id]);
+  expect(await api.expireTemporaryReservations()).toBe(1);
+  const releases = (await pool.query(`SELECT p.* FROM scheduling.outbox_publications p JOIN scheduling.events e ON e.id=p.event_id
+    WHERE e.type='SlotReleased' AND e.payload->>'reservationId'=$1`, [offer.id])).rows;
+  await messages.allocate({ version: 1, publicationId: releases[0].id, eventId: releases[0].event_id, consumer: "allocation", cycle: 0, attempt: 0 });
+  const before = (await pool.query("SELECT * FROM scheduling.reservations WHERE slot_id='offer-test-h' AND state='OFFERED'")).rows;
+  expect(before).toHaveLength(1); expect(before[0].patient_id).toBe("patient-bruno");
+  expect(await api.confirmReservation("patient-ana", offer.id)).toMatchObject({ status: 409, body: { id: offer.id, state: "EXPIRED" } });
+  expect((await pool.query("SELECT * FROM scheduling.reservations WHERE slot_id='offer-test-h' AND state='OFFERED'")).rows).toEqual(before);
+});
+
+it("finishes a checked notice after rejection without touching the subsequent offer", async () => {
+  const { offer, notification } = await offerToAna();
+  await api.joinWaitingList("patient-bruno", scope, "offer-test-next");
+  let flush: (() => void) | undefined;
+  let line = "";
+  const output = new Writable({ write(chunk, _encoding, callback) { line += chunk.toString(); flush = callback; } });
+  const notifying = messageUseCases(scheduling, structuredNotificationWriter(output)).notify(notification);
+  await eventually(async () => Boolean(flush), Boolean);
+  expect((await api.rejectOffer("patient-ana", offer.id)).status).toBe(200);
+  const release = (await pool.query(`SELECT p.* FROM scheduling.outbox_publications p JOIN scheduling.events e ON e.id=p.event_id
+    WHERE e.type='SlotReleased' AND e.payload->>'reservationId'=$1`, [offer.id])).rows[0];
+  await messages.allocate({ version: 1, publicationId: release.id, eventId: release.event_id, consumer: "allocation", cycle: 0, attempt: 0 });
+  const before = (await pool.query("SELECT * FROM scheduling.reservations WHERE slot_id='offer-test-h' AND state='OFFERED'")).rows;
+  expect(before).toHaveLength(1); expect(before[0].patient_id).toBe("patient-bruno");
+  flush!(); await notifying;
+  expect(JSON.parse(line)).toMatchObject({ reservationId: offer.id, expiresAt: offer.expires_at.toISOString() });
+  expect((await pool.query("SELECT * FROM scheduling.reservations WHERE slot_id='offer-test-h' AND state='OFFERED'")).rows).toEqual(before);
+});
+
+it("rolls back an in-flight allocation after SIGKILL before commit and redelivers it once", async () => {
+  const envelope = await allocationReady();
+  const controller = await pool.connect();
+  await controller.query("BEGIN");
+  const pid = (await controller.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+  await controller.query("SELECT pg_advisory_xact_lock(891414)");
+  await pool.query(`CREATE FUNCTION offer_test_pause_outbox() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN IF NEW.consumer='notification' AND EXISTS (SELECT 1 FROM scheduling.events WHERE id=NEW.event_id AND payload->>'hospitalId'='offer-test-hospital')
+    THEN PERFORM pg_advisory_xact_lock(891414); END IF; RETURN NEW; END $$`);
+  await pool.query("CREATE TRIGGER offer_test_pause_outbox BEFORE INSERT ON scheduling.outbox_publications FOR EACH ROW EXECUTE FUNCTION offer_test_pause_outbox()");
+  const connection = await connect(process.env.TEST_RABBITMQ_URL!);
+  const channel = await connection.createConfirmChannel(); await assertTopology(channel);
+  const a = await consumerProcess("offer-test-precommit-A");
+  let b: Awaited<ReturnType<typeof consumerProcess>> | undefined;
+  try {
+    await publishConfirmed(channel, "appointments.work", "allocation", envelope);
+    await awaitBlocked(pool, ["offer-test-precommit-A"], pid);
+    expect((await pool.query("SELECT * FROM scheduling.reservations WHERE slot_id='offer-test-h' AND state='OFFERED'")).rows).toEqual([]);
+    const exited = once(a.child, "exit"); a.child.kill("SIGKILL"); await exited;
+    await controller.query("ROLLBACK");
+    await eventually(async () => (await pool.query("SELECT * FROM pg_stat_activity WHERE application_name='offer-test-precommit-A'")).rows.length, (n) => n === 0);
+    expect((await pool.query("SELECT * FROM scheduling.consumer_results WHERE event_id=$1", [envelope.eventId])).rows).toEqual([]);
+    expect((await pool.query("SELECT * FROM scheduling.reservations WHERE slot_id='offer-test-h' AND state='OFFERED'")).rows).toEqual([]);
+    b = await consumerProcess("offer-test-precommit-B");
+    await eventually(async () => b!.phases.includes("committed"), Boolean, 8000);
+    expect((await pool.query("SELECT count(*)::integer AS n FROM scheduling.reservations WHERE slot_id='offer-test-h' AND state='OFFERED'")).rows[0].n).toBe(1);
+  } finally {
+    await controller.query("ROLLBACK"); controller.release();
+    await a.stop(); await b?.stop(); await channel.close(); await connection.close();
+    await pool.query("DROP TRIGGER offer_test_pause_outbox ON scheduling.outbox_publications");
+    await pool.query("DROP FUNCTION offer_test_pause_outbox()");
+  }
+}, 15000);
+
+it("repeats a real notice after SIGKILL between completed output and SQL result without a second offer", async () => {
+  const { offer, notification } = await offerToAna();
+  const connection = await connect(process.env.TEST_RABBITMQ_URL!);
+  const channel = await connection.createConfirmChannel(); await assertTopology(channel);
+  const processes: { child: ReturnType<typeof spawn>; phases: { phase: string; eventId?: string }[]; logs: () => string }[] = [];
+  const start = async (pause: boolean) => {
+    const phases: { phase: string; eventId?: string }[] = []; let logs = "";
+    const child = spawn(process.execPath, ["test/helpers/notification-crash-process.ts"], { env: {
+      ...process.env, DATABASE_URL: databaseUrl, RABBITMQ_URL: process.env.TEST_RABBITMQ_URL,
+      PAUSE_AFTER_OUTPUT_EVENT_ID: pause ? notification.eventId : "",
+    }, stdio: ["ignore", "pipe", "pipe", "ipc"] });
+    child.on("message", (value: { phase: string; eventId?: string }) => phases.push(value));
+    child.stdout?.on("data", (data: Buffer) => { logs += data.toString(); });
+    child.stderr?.on("data", (data: Buffer) => { logs += data.toString(); });
+    const processState = { child, phases, logs: () => logs }; processes.push(processState);
+    await eventually(async () => phases.some((value) => value.phase === "ready"), Boolean, 8000);
+    return processState;
+  };
+  try {
+    const a = await start(true);
+    await publishConfirmed(channel, "appointments.work", "notification", notification);
+    await eventually(async () => a.phases.some((value) => value.phase === "written" && value.eventId === notification.eventId), Boolean, 8000);
+    expect((await pool.query("SELECT * FROM scheduling.consumer_results WHERE event_id=$1", [notification.eventId])).rows).toEqual([]);
+    const exited = once(a.child, "exit"); a.child.kill("SIGKILL"); await exited;
+    const b = await start(false);
+    await eventually(async () => b.phases.some((value) => value.phase === "committed" && value.eventId === notification.eventId), Boolean, 8000);
+    const notices = processes.flatMap((value) => value.logs().split("\n").flatMap((line) => {
+      try { const parsed = JSON.parse(line); return parsed.eventId === notification.eventId ? [parsed] : []; } catch { return []; }
+    }));
+    expect(notices).toHaveLength(2); expect(notices[0]).toEqual(notices[1]);
+    expect((await api.getReservation("patient-ana", offer.id)).body).toMatchObject({ state: "OFFERED", expiresAt: offer.expires_at.toISOString() });
+    expect((await pool.query("SELECT outcome FROM scheduling.consumer_results WHERE event_id=$1", [notification.eventId])).rows).toEqual([{ outcome: "succeeded" }]);
+  } finally {
+    for (const value of processes) if (value.child.exitCode === null && value.child.signalCode === null) { const exited = once(value.child, "exit"); value.child.kill("SIGTERM"); await exited; }
+    await channel.close(); await connection.close();
   }
 }, 15000);

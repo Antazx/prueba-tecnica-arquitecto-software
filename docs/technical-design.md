@@ -1,72 +1,145 @@
-# Referencia para el diseño técnico
+# Diseño técnico de la entrega
 
-El [diseño funcional consolidado](functional-design.md) es la referencia vigente
-de las decisiones del ejercicio. Su revisión 5, de 2026-11-16, incorpora Q1–Q26,
-la revisión de Q2 y los criterios AC01–AC69.
+La [revisión funcional 5](functional-design.md), de 2026-11-16, es normativa:
+Q1–Q26 y AC01–AC69. Este documento describe su implementación; no añade reglas
+funcionales. El [README](../README.md) contiene los comandos operativos y la
+[matriz de aceptación](acceptance.md) enlaza pruebas y evidencia.
 
-Este archivo se mantiene como punto de entrada y sustituye la recopilación
-parcial anterior. Las reglas, contratos, límites, alternativas y pruebas de
-aceptación se consultan en el documento consolidado, sin mantener otra
-especificación en paralelo.
+## Composición
 
-El [enunciado](diagnostic-appointment-requirements.pdf) conserva los requisitos
-originales; el [glosario](../GLOSSARY.md) fija el vocabulario y los
-[ADR](adr/) explican decisiones seleccionadas. El README resume el alcance y
-documenta los comandos realmente disponibles.
+`src/bootstrap/api.ts` y `worker.ts` inicializan esquema/seed y conectan los
+adaptadores. La API sirve las nueve rutas de negocio; el worker combina barrido,
+dos consumidores y un relay opcional por configuración. La herramienta
+`recover-message.ts` ejecuta recuperaciones locales explícitas.
 
-La implementación funcional, su configuración y sus pruebas siguen pendientes.
-La sincronización documental no acredita resultados de ejecución.
+```text
+HTTP → casos de uso → Scheduling.transaction → PostgreSQL
+                         reglas puras             │
+                                             eventos/outbox
+                                                  ↓
+                                        relay → RabbitMQ
+                                                  ↓
+                                     consumidores → casos de uso
+                                                  ↓
+                                           aviso estructurado
+```
 
-## Procedencia e integridad
+`src/scheduling/domain/` contiene reglas puras con tiempo explícito.
+`application/` expresa transiciones y el puerto específico `Scheduling`, cuyo
+callback usa operaciones de citación. `adapters/` implementa HTTP, PostgreSQL,
+RabbitMQ y salida del aviso. No se expone `PoolClient` fuera del adaptador ni se
+usan transacciones anidadas, repositorios genéricos o mutex de proceso.
 
-La base importada fue la revisión 4, idéntica entonces al documento de trabajo,
-con SHA-256:
+## Persistencia y protocolo transaccional
+
+`db/schema.sql` conserva hospitales, tipos, recursos, pacientes sintéticos,
+ámbitos, huecos, inscripciones, exclusiones y reservas con identidad estable.
+Las claves compuestas impiden mezclar recurso/ámbito; los checks exigen intervalos
+no vacíos y precisión de milisegundos. Inicialización valida solapamientos por
+recurso. `demo_seed` fija un ancla persistida; inicializaciones repetidas no mueven
+las fechas ni duplican filas. No es un sistema de migraciones de bases pobladas.
+
+Índices únicos parciales protegen ocupante por hueco, inscripción activa por
+paciente/ámbito y oferta por inscripción. Una fila temporal vencida sigue
+ocupando hasta que una escritura materializa su cierre. El historial conserva
+el máximo de `admission_order` bigint para nuevas altas; no se ordena por timestamp.
+Cada cierre de reserva tiene una única causa y evento asociado.
+
+En `adapters/postgres/scheduling.ts` las transacciones usan `READ COMMITTED`:
+
+1. Coordinar clave HTTP o pareja evento/consumidor si corresponde; recuperar
+   resultado tras cualquier espera técnica.
+2. Adquirir la fila estable del ámbito como primer bloqueo de negocio; bloquear
+   filas relacionadas en orden estable y releer mediante comandos posteriores.
+3. Tomar `date_trunc('milliseconds', clock_timestamp())` después de la coordinación
+   y decidir con el estado protegido. No usar el tiempo de inicio de transacción.
+4. Guardar negocio, resultado y outbox atómicamente; commit antes de respuesta/ack.
+
+Un conflicto funcional puede comprometer caducidad/liberación ya válida y devolver
+`409`; una excepción técnica revierte la transacción. Los GET toman una fotografía
+coherente de estado/tiempo sin escrituras. Lock/statement timeout acotan esperas
+individuales a 2/2,5 s. No se mantienen bloqueos de ámbito al esperar red, salida
+del aviso o al paciente. Las pruebas de carreras usan dos procesos/pools y
+`pg_stat_activity`/`pg_blocking_pids` como barreras observables.
+
+## Identidad durable y transporte
+
+`events` conserva el trabajo lógico versionado. `outbox_publications` identifica
+cada envío y conserva consumidor, ciclo/intento, destino, fecha lógica,
+`send_count`, error, próximo envío y `published_at`. Las publicadas no vuelven a
+seleccionarse; incertidumbre antes de registrar confirmación puede duplicar.
+
+El relay configurado único publica secuencialmente con persistencia, `mandatory`
+y confirm. Un return invalida el envío aunque llegue confirm positivo. Un fallo
+conserva su próxima fecha y deja avanzar otras listas. Timeout/cierre retira esa
+generación de conexión; respuestas antiguas no confirman publicaciones nuevas.
+`available_at`, `next_attempt_at` y `consumer_attempts.not_before` se respetan al
+seleccionar. Envios de transporte e intentos de negocio son presupuestos distintos.
+
+`rabbitmq/definitions.json` y `rabbitmq.conf` aprovisionan dos exchanges, dos colas
+principales y sus dos DLQ quorum durables. Principales: límite físico 20, DLX
+`at-least-once`, `reject-publish` y rutas específicas. DLQ: sin TTL, DLX, retorno
+automático ni límite físico. `scripts/verify-rabbitmq.mjs` consulta configuración
+efectiva, bindings, políticas y flags. La falta de ruta DLQ conserva el traslado
+en el broker hasta reparación; su timer interno es distinto de los reintentos SQL.
+El volumen y hostname estables conservan identidad. Un miembro quorum no es HA.
+
+## Consumo, fallos y recuperación
+
+`consumer_results` coordina globalmente evento/consumidor y conserva el terminal
+`succeeded` o `discarded`; protege todos los ciclos/intentos. `consumer_cycles`
+y `consumer_attempts` conservan presupuesto, estados, fallos y fechas.
+El consumidor adquiere esa coordinación antes del ámbito y hace ack después del
+commit. Duplicados o intentos viejos no duplican efectos ni reinician presupuesto.
+
+Un fallo específico hace rollback; otra transacción vuelve a coordinar y revalida
+si otra entrega ganó antes de programar 5 s, 30 s y 120 s. El cuarto fallo o uno
+permanente aparca y guarda publicación DLQ antes del ack. Una caída global de
+PostgreSQL/salida pausa consumo con espera; no agota intentos en masa. El límite
+físico del broker cubre caídas anteriores al registro SQL. Aparcado no es éxito.
+
+`consumer_recoveries` registra publicación de origen, operador, motivo y nuevo
+ciclo/publicación. La herramienta valida procedencia DLQ o evidencia persistida,
+coordina como el consumidor y comprueba terminal, ciclo e intento vigentes. Un
+índice impide dos recuperaciones efectivas del mismo ciclo. Registra auditoría,
+intento cero y outbox antes de retirar la entrega; commit incierto o caída preack
+se resuelven por esa evidencia. No reproduce toda la outbox publicada, modifica
+contenido ni amplía deadlines. El modo persistido no requiere RabbitMQ; el modo
+DLQ usa conexión dedicada con cierre acotado y conserva entregas no seleccionadas.
+
+## Adjudicación y aviso
+
+Una revisión relee todo el ámbito y tiempo actual; recorre huecos futuros por
+inicio/ID y FIFO por elegibilidad/exclusiones. Un origen reocupado o iniciado no
+invalida revisar otros huecos. Oferta, inscripción `OFFERED`, `OfferCreated` y
+outbox se comprometen juntos. Aceptar conserva ID; rechazar conserva antigüedad
+y activa el ámbito mediante una sola liberación. Barrido y peticiones comparten
+coordinación y reglas de caducidad.
+
+El aviso relee la reserva concreta próxima a la escritura y espera su callback
+antes de resultado/ack; solo conserva el bloqueo técnico del evento/consumidor.
+Puede repetirse después de escritura/caída o terminar tras rechazo/vencimiento.
+No toca una reserva sustituta ni acredita recepción humana. La aceptación siempre
+revalida. Una oferta puede vencer sin aviso útil. Las pruebas no atribuyen los
+fake timers de JavaScript al reloj de PostgreSQL: igualdad exacta se prueba en
+reglas puras y cruces reales con barreras de BD en integración.
+
+## Operación y alcance de evidencia
+
+El [README](../README.md) diferencia reinicio reteniendo los dos volúmenes,
+recreación sintética coordinada y backup no implementado. No hay purgas al
+arrancar. API/consumidores son procesos separados; el relay no tiene liderazgo ni
+relevo automáticos. Identidad por cabecera y operador CLI no están autenticados.
+Las pruebas de integración y pocas E2E cubren transporte/persistencia reales;
+no constituyen una demostración de todas las permutaciones, HA o capacidad.
+
+## Procedencia e integridad funcional
+
+La base importada fue revisión 4, SHA-256
 `711eae6e4d2b7f392b23a723947e5777f47eac96bdde5f158e0600ce6e8c5f84`.
-
-La revisión 5 incorpora Q25 y Q26, aceptadas después, y corrige AC30, AC57 y 15.6
-para expresar las precondiciones completas de Q24. AC68–AC69 explicitan límites
-ya aceptados, sin decisiones nuevas de producto. El glosario y los ADR anteriores
-siguen siendo compatibles; estos dos acuerdos precisan contratos observables.
-
-La revisión 5 se ha sincronizado con el documento de trabajo de Obsidian y se
-ha comprobado igualdad byte por byte. SHA-256 de ambas copias vigentes:
+La revisión 5 incorporó Q25/Q26 y precisó Q24, AC30, AC57 y §15.6;
+AC68–AC69 explicitan límites ya aceptados. Se comprobó igualdad byte a byte con
+el documento de trabajo al consolidarla. Su SHA-256 conservado es
 `c941187ff1c7f1ff493464ec3906b83c37acce96c130c7781d5c9682073c65f8`.
-
-## Reanudar `to-spec` tras limpiar el contexto
-
-Esta es la continuación de la tarea de diseño en la rama
-`docs/appointment-design-review`. La documentación todavía tiene cambios sin
-commit: limpiar el contexto de conversación no debe descartar esos archivos ni
-tratarlos como trabajo ajeno que haya que reemplazar.
-
-Antes de redactar la spec:
-
-1. Leer las [instrucciones del proyecto](../AGENTS.md), el [README](../README.md)
-   y el [diseño consolidado](functional-design.md) completo, con Q1–Q26 y
-   AC01–AC69. No usar una revisión anterior como sustituto de estas decisiones.
-2. Usar el [glosario](../GLOSSARY.md) y consultar los [ADR](adr/). Mantener la
-   distinción entre decisiones aceptadas, propuestas de calidad y resultados
-   todavía no acreditados.
-3. Leer la skill `to-spec`, el [gestor de tareas](agents/issue-tracker.md) y las
-   [etiquetas de clasificación](agents/triage-labels.md). La cuenta autorizada es
-   `Antazx`; el destino es `Antazx/prueba-tecnica-arquitecto-software`.
-4. Sintetizar en español el problema, solución, historias de usuario, decisiones,
-   pruebas y exclusiones según la plantilla de la skill. No reabrir el grilling
-   ni incorporar rutas personales o detalles técnicos todavía no decididos.
-5. Conservar las fronteras de prueba acordadas: reglas puras con tiempo
-   controlado; integración con PostgreSQL y RabbitMQ reales; contratos HTTP;
-   pocas E2E completas. El caso de concurrencia exige procesos de API separados
-   y barreras observables; las pruebas temporales no confunden un reloj falso
-   de JavaScript con el reloj de PostgreSQL.
-
-El código disponible corresponde a la preparación técnica: API de salud y
-worker de conexiones, sin citación funcional ni resultados de AC01–AC69. Los
-cambios de implementación iniciados por error durante el grilling fueron
-deshechos.
-
-La especificación se ha publicado en la [incidencia #3](https://github.com/Antazx/prueba-tecnica-arquitecto-software/issues/3)
-con el perfil `Antazx` y la etiqueta `ready-for-agent`. Sintetiza la revisión 5,
-Q1–Q26 y AC01–AC69; las fronteras de prueba se han vuelto a confirmar con el
-usuario. Se ha verificado que el contenido publicado coincide íntegramente con
-el borrador preparado. Esta continuación de `to-spec` no implementa funcionalidad
-ni acredita pruebas de comportamiento.
+El PDF original se conserva sin modificación. La entrega técnica no altera esas
+fuentes ni mantiene otra especificación funcional en paralelo.
