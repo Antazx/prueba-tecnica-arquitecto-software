@@ -724,7 +724,6 @@ coordinación; no atribuyen el reloj de PostgreSQL a temporizadores JavaScript.
 
 ## Alcance pendiente
 
-- Rechazo de ofertas y retirada con oferta (#9).
 - Presupuesto lógico, backoff SQL, aparcado de fallos y recuperación manual
   (#12–#13). Hasta entonces un fallo revierte negocio y conserva la entrega,
   espera un segundo antes de rechazar/reencolar cada fallo y usa la protección
