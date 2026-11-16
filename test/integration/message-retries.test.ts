@@ -353,10 +353,14 @@ it("leaves all notifications pending when their shared output sink is broken", a
 });
 
 it("physically parks real process crashes before any SQL failure evidence without completing the business", async () => {
+  const completed = await work();
+  await messageUseCases(store, async () => {}).allocate(completed);
+  // A preceding consumer may have committed but lost its ack before shutdown.
+  await publishDelivery(channel, completed);
   const delivery = await work();
   await publishDelivery(channel, delivery);
   for (let failure = 0; failure <= 20; failure++) {
-    const child = await consumerProcess({ PAUSE_BEFORE_HANDLE: "true" });
+    const child = await consumerProcess({ PAUSE_BEFORE_EVENT_ID: delivery.eventId });
     try {
       await eventually(async () => child.phases.some((phase) => phase.phase === "received" && phase.delivery?.eventId === delivery.eventId), Boolean, 5000);
     } finally { await child.stop("SIGKILL"); }
@@ -367,5 +371,7 @@ it("physically parks real process crashes before any SQL failure evidence withou
   expect(dead.properties.headers?.["x-death"]?.[0]).toMatchObject({ reason: "delivery_limit", queue: "appointments.allocation" });
   expect((await pool.query("SELECT * FROM scheduling.consumer_results WHERE event_id=$1", [delivery.eventId])).rows).toEqual([]);
   expect((await pool.query("SELECT * FROM scheduling.consumer_attempts WHERE event_id=$1", [delivery.eventId])).rows).toEqual([]);
+  expect((await pool.query("SELECT attempt,outcome FROM scheduling.consumer_attempts WHERE event_id=$1", [completed.eventId])).rows)
+    .toEqual([{ attempt: 0, outcome: "succeeded" }]);
   channel.ack(dead);
 }, 45000);
