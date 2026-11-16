@@ -90,8 +90,8 @@ Q17 conserva un límite físico finito en RabbitMQ y exige traslado seguro a DLQ
 mediante `at-least-once`, `reject-publish` y DLX configurado. El presupuesto lógico
 de PostgreSQL se mantiene separado; ambos motivos de aparcado serán recuperables.
 La topología versionada y su configuración efectiva se comprueban con servicios
-reales. Los reintentos lógicos y el aparcado ya están implementados; la recuperación
-manual se entrega por separado.
+reales. Los reintentos lógicos, el aparcado y la recuperación manual explícita
+de ambos orígenes están implementados.
 
 Q21 conserva los registros técnicos durante toda la vida de la demo, sin purgas
 automáticas. Q22 hace prevalecer la caducidad al intentar cancelar un bloqueo
@@ -116,8 +116,8 @@ Están implementados la consulta de agenda, los bloqueos, su consulta propia,
 confirmación, cancelación y barrido de bloqueos vencidos con outbox, además del
 alta/consulta/retirada de espera y su prioridad, adjudicación asíncrona,
 aviso, aceptación, rechazo, barrido de ofertas y reinscripción independiente del
-barrido. También están implementados los reintentos durables y el aparcado; queda
-pendiente la herramienta de recuperación manual.
+barrido. También están implementados los reintentos durables, el aparcado y la
+herramienta local de recuperación manual.
 
 ## Arranque con un comando
 
@@ -768,11 +768,105 @@ y antes del ack. También comprueba caída repetida antes de cualquier registro 
 aparcado de aplicación con ruta DLQ rota y traslado del broker con destino sin
 ruta. Estos experimentos distinguen siempre intentos SQL de envíos y fallos AMQP.
 
+## Recuperación manual de trabajo aparcado
+
+Tras diagnosticar y corregir la causa, el operador selecciona una publicación
+concreta. La herramienta conserva el evento y consumidor, registra la decisión
+y crea el intento cero de un ciclo nuevo junto con su publicación pendiente.
+Los consumidores normales aplican otra vez el presupuesto de cuatro intentos
+y esperas de 5 s, 30 s y 120 s. Ni el contenido del evento ni los plazos de reservas
+existentes cambian. El aviso vencido termina descartado; una revisión sigue
+examinando el ámbito vigente aunque su hueco de origen esté ocupado o iniciado.
+
+Para identificar candidatos mediante evidencia técnica retenida, sin leer datos
+de pacientes:
+
+```bash
+docker compose exec -T postgres psql -U diagnostic -d diagnostic_appointments -c "
+SELECT p.id AS publication_id, p.event_id, p.consumer, p.cycle, p.attempt,
+       p.destination, p.published_at, p.send_count, p.last_error,
+       r.current_cycle, r.outcome, c.state, c.park_reason
+FROM scheduling.outbox_publications p
+LEFT JOIN scheduling.consumer_results r USING (event_id, consumer)
+LEFT JOIN scheduling.consumer_cycles c USING (event_id, consumer, cycle)
+WHERE p.destination='dead' OR c.state='parked'
+   OR ((p.published_at IS NOT NULL OR p.send_count>0) AND r.outcome IS NULL)
+ORDER BY p.created_at, p.id;"
+```
+
+Esta consulta muestra candidatos, no acredita por sí sola un mensaje perdido.
+Un aparcado físico puede no tener aún resultado ni fallo SQL. En el modo DLQ se
+verifica la ruta de la entrega, su identidad y publicación retenida. El origen
+físico exige `x-death` por `delivery_limit` de su cola de trabajo; el origen de
+aplicación exige una publicación `dead` del ciclo aparcado. Sustituye el UUID
+ficticio por el `publication_id` exacto y el consumidor correspondiente:
+
+```bash
+docker compose exec -T worker node dist/bootstrap/recover-message.js \
+  --mode dlq --consumer allocation \
+  --publication-id 00000000-0000-4000-8000-000000000001 \
+  --operator demo-operator --reason 'Causa sintética corregida y verificada'
+```
+
+La búsqueda inspecciona como máximo 100 mensajes listos de esa DLQ; puede usarse
+`--scan-limit` entre 1 y 1000. Mantiene sin reconocer los mensajes no seleccionados
+y los devuelve al cerrar su canal. La selección puede fallar si el mensaje está
+en poder de otro operador, todavía no está listo o queda fuera del límite; no
+repite indefinidamente ni purga la cola. El cierre y las reentregas pueden cambiar
+el orden físico de la DLQ, sin alterar el FIFO de inscripciones del negocio.
+Los envelopes desconocidos o con procedencia incompatible permanecen para
+diagnóstico, sin descarte automático.
+
+Si se ha comprobado que falta el mensaje físico, se puede elegir expresamente
+el modo por evidencia persistida. Exige la publicación exacta, operador y motivo;
+admite una publicación de aparcado con su ciclo SQL o una publicación de trabajo
+con evidencia retenida de envío confirmado o intentado. Una publicación de
+trabajo nunca enviada sigue a cargo del relay y se rechaza. Este modo no conecta
+con RabbitMQ y permite registrar la recuperación mientras está caído:
+
+```bash
+docker compose exec -T worker node dist/bootstrap/recover-message.js \
+  --mode persisted \
+  --publication-id 00000000-0000-4000-8000-000000000001 \
+  --operator demo-operator --reason 'Ausencia física comprobada; causa sintética corregida'
+```
+
+En ejecución local con Node y `DATABASE_URL`/`RABBITMQ_URL` configurados, la misma
+interfaz está en `pnpm recover:message`. Los operadores y motivos quedan
+persistidos: usar referencias técnicas sintéticas, sin datos de pacientes ni
+credenciales. No existe autenticación de operador en esta herramienta local.
+
+La salida JSON `manual_recovery` incluye `outcome`, `cycle` y `publicationId`.
+`recovered` identifica el nuevo trabajo o la recuperación anterior reconocida;
+`already_completed` conserva un resultado terminal, y `superseded` indica que
+existe un ciclo o intento posterior. Estos dos últimos no crean publicaciones.
+`manual_recovery_failed` produce salida de error y código distinto de cero; en
+modo DLQ conserva la entrega sin ack. Si la entrega ya fue retirada tras un éxito,
+una repetición DLQ puede no encontrarla; la selección persistida del mismo ID
+permite comprobar la recuperación registrada.
+
+La pareja evento/consumidor se coordina con el mismo bloqueo global de los
+consumidores, antes de tocar el ámbito de negocio. La recuperación valida el
+ciclo actual y su intento más reciente: una copia antigua del mismo ciclo no
+invalida un retry posterior. Un índice único impide abrir dos ciclos desde el
+mismo ciclo de origen. Se guardan `consumer_recoveries`, nuevo ciclo, intento y
+outbox en una transacción antes del ack. Una caída tras commit, un commit cuya
+respuesta se pierde, dos operadores o copias físicas reconocen esa recuperación.
+Un fallo SQL revierte todo y conserva el original. Si falla el broker, el nuevo
+trabajo conserva su publicación pendiente y las esperas del relay. El historial
+publicado se retiene y no se reproduce en bloque. Recuperar después otro ciclo
+aparcado requiere seleccionar explícitamente su propia publicación.
+
+Las pruebas `manual-recovery.test.ts` usan PostgreSQL y RabbitMQ reales: aparcado
+físico sin fallo SQL, 22 fallos SQL al consumir la propia DLQ sin perder el mensaje,
+dos procesos operadores con barrera observada, un consumidor concurrente,
+`SIGKILL` tras commit y antes del ack, copias de DLQ, pérdida TCP de la respuesta
+de commit y broker inaccesible. También comprueban la continuidad del presupuesto,
+el descarte del aviso vencido, el resultado terminal y la revisión de otro hueco
+con el origen iniciado u ocupado.
+
 ## Alcance pendiente
 
-- Herramienta de recuperación manual idempotente de ambos caminos de DLQ (#13),
-  incluidos aparcados físicos sin fallo SQL previo. Hasta incorporarla, reparar
-  una causa no abre automáticamente otro ciclo ni saca trabajo de las DLQ.
 - Consolidación final de documentación y cobertura compartida (#14).
 
 Los volúmenes y el nombre de nodo conservan estado en reinicios normales. Este

@@ -17,7 +17,8 @@
     "start:worker": "node --env-file-if-exists=.env dist/bootstrap/worker.js",
     "dev:api": "node --watch --env-file-if-exists=.env src/bootstrap/api.ts",
     "dev:worker": "node --watch --env-file-if-exists=.env src/bootstrap/worker.ts",
-    "check:connections": "node --env-file-if-exists=.env src/bootstrap/check-connections.ts"
+    "check:connections": "node --env-file-if-exists=.env src/bootstrap/check-connections.ts",
+    "recover:message": "node --env-file-if-exists=.env src/bootstrap/recover-message.ts"
   },
   "dependencies": {
     "amqplib": "2.3.1",

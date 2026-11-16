@@ -2,6 +2,7 @@ import type { WaitingListEntry, WaitingListRepresentation, WaitingListScope, Adm
 import type { ReservationClosureReason, ReservationState } from "../domain/reservation.ts";
 import type { Delivery, LogicalEvent, OfferNotification } from "./messages.ts";
 import type { FailurePlan } from "../domain/message-retries.ts";
+import type { RecoveryRequest, RecoveryResult } from "./recovery.ts";
 
 export interface Reservation {
   id: string;
@@ -32,6 +33,7 @@ export interface ProtectedSlot { id: string; startsAt: number; endsAt: number; o
 
 // All methods in this callback share one transaction. No driver object crosses this boundary.
 export interface SchedulingTransaction {
+  recoverConsumption(request: RecoveryRequest): Promise<RecoveryResult>;
   coordinateConsumption(delivery: Delivery): Promise<LogicalEvent | null>;
   completeConsumption(delivery: Delivery, outcome: "succeeded" | "discarded", time: number): Promise<void>;
   failConsumption(delivery: Delivery, error: string, permanent: boolean, plan: FailurePlan, time: number): Promise<void>;
