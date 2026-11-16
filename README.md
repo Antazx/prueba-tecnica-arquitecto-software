@@ -817,6 +817,12 @@ el orden físico de la DLQ, sin alterar el FIFO de inscripciones del negocio.
 Los envelopes desconocidos o con procedencia incompatible permanecen para
 diagnóstico, sin descarte automático.
 
+La operación usa una conexión dedicada y poseída. Espera como máximo 500 ms la
+confirmación de cierre del canal; ante error o respuesta retenida retira toda esa
+conexión mediante su cierre acotado a otros 500 ms y `AbortSignal`. No reutiliza
+esa generación. Un corte después del commit y antes del ack conserva la entrega
+reentregada y reconoce el mismo ciclo, sin repetir la recuperación SQL.
+
 Si se ha comprobado que falta el mensaje físico, se puede elegir expresamente
 el modo por evidencia persistida. Exige la publicación exacta, operador y motivo;
 admite una publicación de aparcado con su ciclo SQL o una publicación de trabajo

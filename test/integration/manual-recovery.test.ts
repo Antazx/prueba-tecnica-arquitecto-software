@@ -19,6 +19,7 @@ import { connectToRabbitMq, closeRabbitMq } from "../../src/scheduling/adapters/
 import type { RecoveryResult } from "../../src/scheduling/application/recovery.ts";
 import { readRecoveryPublication } from "../../src/scheduling/adapters/postgres/recovery.ts";
 import { schedulingUseCases } from "../../src/scheduling/application/reservations.ts";
+import { setTimeout as pause } from "node:timers/promises";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (!databaseUrl) throw new Error("TEST_DATABASE_URL is required");
@@ -154,6 +155,45 @@ it("resolves an uncertain recovery commit from retained evidence without opening
     expect((await pool.query("SELECT * FROM scheduling.consumer_recoveries WHERE event_id=$1", [dead.eventId])).rows).toEqual(history);
     ownPublications.add(result.publicationId!);
   } finally { await uncertain.end(); await proxy.close(); }
+});
+
+it("bounds a retained DLQ Channel.CloseOk after commit without losing its durable recovery", async () => {
+  const dead = await parked(); await publishDelivery(channel, dead);
+  const proxy = await amqpProxy(process.env.TEST_RABBITMQ_URL!);
+  const interrupted = await connectToRabbitMq(proxy.url); interrupted.on("error", () => {});
+  const recovery = recoverDlq(interrupted, selection(dead), async (request) => {
+    const result = await recoverMessage(store, request);
+    proxy.peers[0].paused = true;
+    return result;
+  });
+  try {
+    const result = await Promise.race([recovery.then((value) => ({ value })), pause(1500).then(() => ({ timeout: true }))]);
+    expect(result).not.toHaveProperty("timeout");
+    expect((await pool.query("SELECT * FROM scheduling.consumer_recoveries WHERE event_id=$1", [dead.eventId])).rows).toHaveLength(1);
+  } finally {
+    proxy.release(0);
+    await recovery.catch(() => {}); await closeRabbitMq(interrupted); await proxy.close();
+  }
+}, 10000);
+
+it("preserves the original DLQ delivery when its transport is cut after commit before ack", async () => {
+  const dead = await parked(); await publishDelivery(channel, dead);
+  const proxy = await amqpProxy(process.env.TEST_RABBITMQ_URL!);
+  const interrupted = await connectToRabbitMq(proxy.url); interrupted.on("error", () => {});
+  try {
+    await recoverDlq(interrupted, selection(dead), async (request) => {
+      const result = await recoverMessage(store, request);
+      proxy.setAvailable(false);
+      return result;
+    }).catch(() => {});
+    const history = (await pool.query("SELECT * FROM scheduling.consumer_recoveries WHERE event_id=$1", [dead.eventId])).rows;
+    expect(history).toHaveLength(1);
+    await eventually(async () => (await channel.checkQueue("appointments.allocation.dlq")).messageCount, (count) => count >= 1, 5000);
+    const result = await recoverDlq(connection, selection(dead), (request) => recoverMessage(store, request));
+    expect(result).toMatchObject({ outcome: "recovered", cycle: 1, publicationId: history[0].next_publication_id });
+    expect((await pool.query("SELECT * FROM scheduling.consumer_recoveries WHERE event_id=$1", [dead.eventId])).rows).toEqual(history);
+    expect((await pool.query("SELECT * FROM scheduling.outbox_publications WHERE event_id=$1 AND cycle=1", [dead.eventId])).rows).toHaveLength(1);
+  } finally { await closeRabbitMq(interrupted); await proxy.close(); }
 });
 
 async function stop(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM") {

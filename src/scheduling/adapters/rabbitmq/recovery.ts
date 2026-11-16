@@ -2,6 +2,7 @@ import type { ChannelModel } from "amqplib";
 import type { Delivery } from "../../application/messages.ts";
 import type { RecoveryRequest, RecoveryResult } from "../../application/recovery.ts";
 import { parseDelivery, queues } from "./messaging.ts";
+import { closeRabbitMq } from "./connection.ts";
 
 export function recoveryOrigin(delivery: Delivery, fields: { exchange: string; routingKey: string }, headers: Record<string, unknown>): RecoveryRequest["source"] {
   if (fields.exchange !== "appointments.dead" || fields.routingKey !== `${delivery.consumer}.dead`) {
@@ -19,8 +20,8 @@ export function recoveryOrigin(delivery: Delivery, fields: { exchange: string; r
   return "broker_dlq";
 }
 
-// A bounded selection owns its channel. Closing it preserves every unselected or
-// failed delivery, including an uncertain SQL commit; the DLQ has no delivery limit.
+// Use a dedicated connection from connectToRabbitMq: a stalled channel handshake
+// retires that owned connection as well. Unacknowledged deliveries stay in the DLQ.
 export async function recoverDlq(connection: ChannelModel, selection: {
   consumer: Delivery["consumer"]; publicationId: string; scanLimit: number; operator: string; reason: string;
 }, recover: (request: RecoveryRequest) => Promise<RecoveryResult>): Promise<RecoveryResult> {
@@ -45,5 +46,13 @@ export async function recoverDlq(connection: ChannelModel, selection: {
       return result;
     }
     throw new Error("Selected publication was not found within the bounded DLQ scan; no delivery acknowledged");
-  } finally { await channel.close().catch(() => {}); }
+  } finally {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const closed = await Promise.race([
+      Promise.resolve().then(() => channel.close()).then(() => true, () => false),
+      new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), 500); }),
+    ]);
+    clearTimeout(timer);
+    if (!closed) await closeRabbitMq(connection);
+  }
 }
