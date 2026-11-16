@@ -206,3 +206,28 @@ it("retains unroutable work beyond four transport sends without spending consume
       .toEqual({ send_count: 6, published: true, last_error: "Publication was unroutable" });
   } finally { await channel.bindQueue("appointments.notifications", "appointments.work", "notification"); }
 });
+
+it("records an uncertain SQL publication marker failure and retains the accepted publication for retry", async () => {
+  const pending = await publication("notification");
+  const role = `relay_marker_test_${process.pid}`;
+  await pool.query(`CREATE ROLE ${role} NOLOGIN`);
+  const url = new URL(target); url.searchParams.set("options", `-c role=${role}`);
+  const restricted = createDatabasePool(url.toString());
+  try {
+    await pool.query(`GRANT USAGE ON SCHEMA scheduling TO ${role}`);
+    await pool.query(`GRANT SELECT ON scheduling.outbox_publications,scheduling.consumer_attempts TO ${role}`);
+    await pool.query(`GRANT UPDATE(send_count,last_attempt_at,last_error,next_attempt_at) ON scheduling.outbox_publications TO ${role}`);
+    const store = postgresOutbox(restricted);
+    const outbox = { ...store, ready: async () => (await store.ready()).filter((row) => row.publicationId === pending.publicationId) };
+    await expect(relayReadyPublications(outbox, (delivery) => publishDelivery(channel, delivery), 20)).rejects.toMatchObject({ code: "42501" });
+    const uncertain = (await pool.query("SELECT send_count,published_at,last_error FROM scheduling.outbox_publications WHERE id=$1", [pending.publicationId])).rows[0];
+    expect(uncertain).toMatchObject({ send_count: 1, published_at: null });
+    expect(uncertain.last_error).toContain("permission denied");
+  } finally {
+    await restricted.end();
+    await pool.query(`REVOKE UPDATE(send_count,last_attempt_at,last_error,next_attempt_at) ON scheduling.outbox_publications FROM ${role}`);
+    await pool.query(`REVOKE SELECT ON scheduling.outbox_publications,scheduling.consumer_attempts FROM ${role}`);
+    await pool.query(`REVOKE USAGE ON SCHEMA scheduling FROM ${role}`);
+    await pool.query(`DROP ROLE ${role}`);
+  }
+});

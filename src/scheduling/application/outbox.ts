@@ -16,11 +16,14 @@ export async function relayReadyPublications(outbox: Outbox, publish: (delivery:
     let result: PublicationResult;
     try {
       result = await publish(delivery);
+      if (result.accepted) {
+        await outbox.published(delivery.publicationId);
+        continue;
+      }
     } catch (error) {
       await outbox.failed(delivery.publicationId, error instanceof Error ? error.message : "Publication failed", retryDelayMs);
       throw error;
     }
-    if (result.accepted) await outbox.published(delivery.publicationId);
-    else await outbox.failed(delivery.publicationId, result.error, retryDelayMs);
+    await outbox.failed(delivery.publicationId, result.error, retryDelayMs);
   }
 }
