@@ -4,6 +4,7 @@ import { evaluateReservation } from "../domain/reservation.ts";
 import { evaluateEntryOffer } from "../domain/offers.ts";
 import type { Reservation, Scheduling, SchedulingTransaction } from "./scheduling.ts";
 import { representReservation as represent } from "./reservation-representation.ts";
+import { expireReservation } from "./reservation-expiry.ts";
 
 export interface WaitingListScope { hospitalId: string; testTypeId: string }
 export interface WaitingListEntry extends WaitingListScope {
@@ -31,10 +32,8 @@ async function expireAdmissionReservations(transaction: SchedulingTransaction, s
   let released = false;
   for (const reservation of state.reservations) {
     if (!["HELD", "OFFERED"].includes(reservation.state) || !pertinent(reservation) || !evaluateReservation(reservation, time).expired) continue;
-    await transaction.setReservationState(reservation.id, "EXPIRED");
-    await transaction.recordSlotRelease(reservation, "EXPIRED", time);
+    await expireReservation(transaction, reservation, time);
     if (reservation.waitingListEntryId) {
-      await transaction.closeWaitingListEntry(reservation.waitingListEntryId, "EXPIRED");
       const entry = state.entries.find((entry) => entry.id === reservation.waitingListEntryId);
       if (entry) { entry.state = "CLOSED"; entry.closureReason = "EXPIRED"; }
     }

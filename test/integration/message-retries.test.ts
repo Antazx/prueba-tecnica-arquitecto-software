@@ -3,7 +3,7 @@ import { afterAll, beforeAll, expect, it } from "vitest";
 import { createDatabasePool } from "../../src/scheduling/adapters/postgres/database.ts";
 import { initializeDatabase } from "../../src/scheduling/adapters/postgres/initialize.ts";
 import { postgresScheduling } from "../../src/scheduling/adapters/postgres/scheduling.ts";
-import { messageUseCases, type Delivery } from "../../src/scheduling/application/messages.ts";
+import { ConsumptionPaused, messageUseCases, type Delivery } from "../../src/scheduling/application/messages.ts";
 import { postgresOutbox } from "../../src/scheduling/adapters/postgres/outbox.ts";
 import { connect, type ChannelModel, type ConfirmChannel } from "amqplib";
 import { assertTopology, publishDelivery } from "../../src/scheduling/adapters/rabbitmq/messaging.ts";
@@ -351,6 +351,39 @@ it("leaves all notifications pending when their shared output sink is broken", a
   expect((await pool.query("SELECT attempt,outcome FROM scheduling.consumer_attempts WHERE event_id=ANY($1::uuid[])", [notifications.map((row) => row.eventId)])).rows)
     .toEqual(notifications.map(() => ({ attempt: 0, outcome: "succeeded" })));
 });
+
+it("preserves original notification attempts while a shared output stalls and resumes them after repair", async () => {
+  const notifications = [await offeredNotification(), await offeredNotification()];
+  const eventIds = notifications.map((row) => row.eventId);
+  let completeWrite: (() => void) | undefined;
+  let blocked = true;
+  const lines: string[] = [];
+  const output = new Writable({ write(chunk, _encoding, callback) {
+    lines.push(chunk.toString());
+    if (blocked) completeWrite = callback;
+    else callback();
+  } });
+  const messages = messageUseCases(store, structuredNotificationWriter(output));
+  try {
+    await expect(messages.notify(notifications[0])).rejects.toBeInstanceOf(ConsumptionPaused);
+    const buffered = output.writableLength;
+    for (let redelivery = 0; redelivery < 3; redelivery++) {
+      for (const notification of notifications) await expect(messages.notify(notification)).rejects.toBeInstanceOf(ConsumptionPaused);
+    }
+    expect(output.writableLength).toBe(buffered);
+    expect(lines).toHaveLength(1);
+    expect((await pool.query("SELECT * FROM scheduling.consumer_attempts WHERE event_id=ANY($1::uuid[])", [eventIds])).rows).toEqual([]);
+    expect((await pool.query("SELECT * FROM scheduling.consumer_results WHERE event_id=ANY($1::uuid[])", [eventIds])).rows).toEqual([]);
+    expect((await pool.query("SELECT id,attempt,destination FROM scheduling.outbox_publications WHERE event_id=ANY($1::uuid[]) ORDER BY id", [eventIds])).rows)
+      .toEqual(notifications.map((row) => ({ id: row.publicationId, attempt: 0, destination: "work" })).sort((a, b) => a.id.localeCompare(b.id)));
+    blocked = false;
+    completeWrite!();
+    for (const notification of notifications) await messages.notify(notification);
+    expect((await pool.query("SELECT attempt,outcome FROM scheduling.consumer_attempts WHERE event_id=ANY($1::uuid[])", [eventIds])).rows)
+      .toEqual(notifications.map(() => ({ attempt: 0, outcome: "succeeded" })));
+    expect(lines.map((line) => JSON.parse(line).eventId)).toEqual([eventIds[0], ...eventIds]);
+  } finally { output.destroy(); }
+}, 12000);
 
 it("physically parks real process crashes before any SQL failure evidence without completing the business", async () => {
   const completed = await work();

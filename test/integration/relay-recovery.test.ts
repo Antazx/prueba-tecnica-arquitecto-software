@@ -1,6 +1,4 @@
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { once } from "node:events";
 import { connect, type ChannelModel, type ConfirmChannel } from "amqplib";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { createDatabasePool } from "../../src/scheduling/adapters/postgres/database.ts";
@@ -9,8 +7,9 @@ import { assertTopology, publishConfirmed, publishDelivery } from "../../src/sch
 import type { Delivery } from "../../src/scheduling/application/messages.ts";
 import { relayReadyPublications } from "../../src/scheduling/application/outbox.ts";
 import { postgresOutbox } from "../../src/scheduling/adapters/postgres/outbox.ts";
-import { eventually, freePort } from "../helpers/concurrency.ts";
+import { eventually } from "../helpers/concurrency.ts";
 import { amqpProxy } from "../helpers/amqp-proxy.ts";
+import { startWorkerProcess } from "../helpers/worker-process.ts";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const rabbitmqUrl = process.env.TEST_RABBITMQ_URL;
@@ -57,28 +56,10 @@ async function publication(consumer: Delivery["consumer"], age = 0): Promise<Del
 }
 
 async function worker(relay: boolean, brokerUrl = rabbitmqUrl, confirmTimeoutMs = "5000") {
-  const port = await freePort();
-  let logs = "";
-  const child = spawn(process.execPath, ["src/bootstrap/worker.ts"], { cwd: process.cwd(), env: {
-    ...process.env, DATABASE_URL: target.toString(), RABBITMQ_URL: brokerUrl, HOST: "127.0.0.1", WORKER_HEALTH_PORT: String(port),
-    RELAY_ENABLED: String(relay), EXPIRY_SWEEP_INTERVAL_MS: "50", OUTBOX_RETRY_DELAY_MS: "2500",
-    PUBLISHER_CONFIRM_TIMEOUT_MS: confirmTimeoutMs,
-  }, stdio: ["ignore", "pipe", "pipe"] });
-  child.stdout?.on("data", (chunk: Buffer) => { logs += chunk.toString(); });
-  child.stderr?.on("data", (chunk: Buffer) => { logs += chunk.toString(); });
-  const stop = async () => {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    const exited = once(child, "exit"); child.kill("SIGTERM");
-    const timer = setTimeout(() => child.kill("SIGKILL"), 3000);
-    try { await exited; } finally { clearTimeout(timer); }
-  };
-  try {
-    await eventually(async () => {
-      if (child.exitCode !== null) throw new Error(logs);
-      try { return (await fetch(`http://127.0.0.1:${port}/health/ready`)).ok; } catch { return false; }
-    }, Boolean, 8000);
-    return { stop, logs: () => logs };
-  } catch (error) { await stop(); throw new Error(`Worker failed: ${logs}`, { cause: error }); }
+  return startWorkerProcess(target.toString(), brokerUrl!, {
+    relay, expirySweepIntervalMs: 50, outboxRetryDelayMs: 2500, publisherConfirmTimeoutMs: Number(confirmTimeoutMs),
+    readinessTimeoutMs: 8000, shutdownTimeoutMs: 3000,
+  });
 }
 
 it("AC35: publishes P2 while P1 is still unroutable, retains its delay across restart and never promotes W2", async () => {
