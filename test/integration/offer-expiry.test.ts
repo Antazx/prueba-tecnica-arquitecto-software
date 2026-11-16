@@ -3,6 +3,8 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { createDatabasePool } from "../../src/scheduling/adapters/postgres/database.ts";
+import { buildApi } from "../../src/scheduling/adapters/http/api.ts";
+import { readApiContract, expectContractResponse } from "../helpers/openapi.ts";
 import { initializeDatabase } from "../../src/scheduling/adapters/postgres/initialize.ts";
 import { postgresScheduling } from "../../src/scheduling/adapters/postgres/scheduling.ts";
 import { schedulingUseCases } from "../../src/scheduling/application/reservations.ts";
@@ -187,15 +189,22 @@ it("keeps GETs read only, exposes a pending expired offer and never invents expi
   const f = await fixture();
   const readonlyUrl = new URL(isolated); readonlyUrl.searchParams.set("options", "-c default_transaction_read_only=on");
   const reader = createDatabasePool(readonlyUrl.toString());
-  const read = schedulingUseCases(postgresScheduling(reader));
+  const read = buildApi(async () => {}, async () => ({ evaluatedAt: "2030-01-01T00:00:00.000Z", slots: [] }), schedulingUseCases(postgresScheduling(reader)));
   try {
-    expect((await read.getWaitingListEntry("patient-ana", f.entryId)).body).toMatchObject({ state: "OFFERED", temporal: { expired: false, closurePending: false }, actions: { canAcceptOffer: true } });
+    const document = await readApiContract(read);
+    const get = async (resource: "waiting-list-entries" | "reservations", id: string, patientId = "patient-ana") => {
+      const response = await read.inject({ url: `/${resource}/${id}`, headers: { "x-patient-id": patientId } });
+      expect(response.statusCode).toBe(200);
+      expectContractResponse(document, "GET", `/${resource}/{id}`, response);
+      return response.json();
+    };
+    expect(await get("waiting-list-entries", f.entryId)).toMatchObject({ state: "OFFERED", temporal: { expired: false, closurePending: false }, actions: { canAcceptOffer: true } });
     await expire(f.offerId);
-    expect((await read.getWaitingListEntry("patient-ana", f.entryId)).body).toMatchObject({ state: "OFFERED", offer: { id: f.offerId }, temporal: { expired: true, closurePending: true }, actions: { canAcceptOffer: false, canRejectOffer: false } });
-    expect((await read.getReservation("patient-ana", f.offerId)).body).toMatchObject({ state: "OFFERED", temporal: { expired: true, closurePending: true }, actions: { canConfirm: false } });
-    expect((await read.getWaitingListEntry("patient-bruno", f.brunoId!)).body).toMatchObject({ state: "WAITING", temporal: { expired: false, closurePending: false } });
+    expect(await get("waiting-list-entries", f.entryId)).toMatchObject({ state: "OFFERED", offer: { id: f.offerId }, temporal: { expired: true, closurePending: true }, actions: { canWithdraw: false, canAcceptOffer: false, canRejectOffer: false } });
+    expect(await get("reservations", f.offerId)).toMatchObject({ state: "OFFERED", temporal: { expired: true, closurePending: true }, actions: { canConfirm: false } });
+    expect(await get("waiting-list-entries", f.brunoId!, "patient-bruno")).toMatchObject({ state: "WAITING", temporal: { expired: false, closurePending: false } });
     expect(await releaseCount(f.offerId)).toBe(0);
-  } finally { await reader.end(); }
+  } finally { await read.close(); await reader.end(); }
   await api.expireTemporaryReservations();
   const confirmed = await fixture();
   expect((await api.confirmReservation("patient-ana", confirmed.offerId)).status).toBe(200);

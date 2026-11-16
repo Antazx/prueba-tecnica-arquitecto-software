@@ -11,6 +11,8 @@ import { startWorkerProcess } from "../helpers/worker-process.ts";
 import { once } from "node:events";
 import { connect } from "amqplib";
 import { assertTopology, publishConfirmed } from "../../src/scheduling/adapters/rabbitmq/messaging.ts";
+import { buildApi } from "../../src/scheduling/adapters/http/api.ts";
+import { readApiContract, expectContractResponse, expectNetworkContractResponse, type ApiDocument } from "../helpers/openapi.ts";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (!databaseUrl) throw new Error("TEST_DATABASE_URL is required");
@@ -20,6 +22,7 @@ const api = schedulingUseCases(scheduling);
 const messages = messageUseCases(scheduling, async () => {});
 const scope = { hospitalId: "decision-test-hospital", testTypeId: "mri" };
 let servers: Awaited<ReturnType<typeof startApiPair>>;
+let document: ApiDocument;
 
 async function cleanup() {
   const events = "SELECT id FROM scheduling.events WHERE payload->>'hospitalId'='decision-test-hospital'";
@@ -40,6 +43,7 @@ async function cleanup() {
 beforeAll(async () => {
   await initializeDatabase(pool); await cleanup();
   servers = await startApiPair(databaseUrl, "decision-test-api");
+  document = await readApiContract(servers.a.url);
 });
 beforeEach(async () => {
   await pool.query("INSERT INTO scheduling.hospitals VALUES ($1)", [scope.hospitalId]);
@@ -53,13 +57,17 @@ afterAll(async () => { await servers?.stop(); await pool.end(); });
 
 async function post(path: string, patientId = "patient-ana", server = servers.a) {
   const response = await fetch(`${server.url}${path}`, { method: "POST", headers: { "X-Patient-Id": patientId } });
-  return { status: response.status, body: await response.json() };
+  return { status: response.status, body: await expectNetworkContractResponse(document, "POST", path.replace(/\/(reservations|waiting-list-entries)\/[^/]+/, "/$1/{id}"), response) };
 }
 async function create(path: string, patientId: string, key: string, body?: object) {
   const response = await fetch(`${servers.a.url}${path}`, { method: "POST", headers: {
     "X-Patient-Id": patientId, "Idempotency-Key": `decision-test-${key}`, ...(body ? { "Content-Type": "application/json" } : {}),
   }, body: body ? JSON.stringify(body) : undefined });
-  return { status: response.status, body: await response.json() };
+  return { status: response.status, body: await expectNetworkContractResponse(document, "POST", path.replace(/\/slots\/[^/]+/, "/slots/{id}"), response) };
+}
+async function getEntry(id: string, patientId = "patient-ana") {
+  const response = await fetch(`${servers.b.url}/waiting-list-entries/${id}`, { headers: { "X-Patient-Id": patientId } });
+  return { status: response.status, body: await expectNetworkContractResponse(document, "GET", "/waiting-list-entries/{id}", response) };
 }
 async function publications(type = "SlotReleased") {
   return (await pool.query(`SELECT p.*,e.payload FROM scheduling.outbox_publications p JOIN scheduling.events e ON e.id=p.event_id
@@ -75,7 +83,7 @@ async function offerToAna(maximumMs?: number) {
   if (!("admissionOrder" in joined.body)) throw new Error("Expected entry");
   await api.cancelReservation("patient-carlos", hold.body.id);
   await messageUseCases(scheduling, async () => {}, { offerMaximumMs: maximumMs }).allocate(envelope((await publications())[0]));
-  const own = await api.getWaitingListEntry("patient-ana", joined.body.id);
+  const own = await getEntry(joined.body.id);
   if (!("offer" in own.body) || !own.body.offer) throw new Error("Expected offer");
   return { entry: joined.body, offer: own.body.offer };
 }
@@ -97,14 +105,18 @@ async function rowBarrier(reservationId: string) {
 
 it("rejects its own offer through HTTP, retaining FIFO and one unique exclusion/release", async () => {
   const { entry, offer } = await offerToAna();
+  const active = await create("/waiting-list-entries", "patient-ana", "active-offer", scope);
+  expect(active).toMatchObject({ status: 200, body: { id: entry.id, state: "OFFERED", offer } });
   expect(await post(`/reservations/${offer.id}/reject`)).toMatchObject({ status: 200, body: { id: offer.id, state: "CANCELLED" } });
-  expect((await api.getWaitingListEntry("patient-ana", entry.id)).body).toMatchObject({
+  expect((await getEntry(entry.id)).body).toMatchObject({
     id: entry.id, state: "WAITING", admissionOrder: entry.admissionOrder, excludedSlotIds: ["decision-test-h1"],
   });
   expect(await releaseCount(offer.id)).toBe(1);
   expect((await publications()).filter((row) => row.payload.reservationId === offer.id)).toHaveLength(1);
   expect((await publications("AllocationReviewRequested"))).toHaveLength(1);
   expect((await pool.query("SELECT reason FROM scheduling.reservation_closures WHERE reservation_id=$1", [offer.id])).rows).toEqual([{ reason: "OFFER_REJECTED" }]);
+  expect(await create("/waiting-list-entries", "patient-ana", "active-offer", scope)).toEqual(active);
+  expect(await create("/waiting-list-entries", "patient-ana", "join", scope)).toEqual({ status: 201, body: entry });
 });
 
 it("withdraws its offered participation through HTTP and preserves a terminal withdrawal", async () => {
@@ -124,7 +136,7 @@ it.each(["reject", "withdraw"])("materializes an expired offer on late %s with n
   expect(await post(path)).toMatchObject({ status: action === "reject" ? 409 : 200, body: action === "reject"
     ? { id: offer.id, state: "EXPIRED", code: "RESERVATION_EXPIRED" }
     : { id: entry.id, state: "CLOSED", closureReason: "EXPIRED" } });
-  expect((await api.getWaitingListEntry("patient-ana", entry.id)).body).toMatchObject({ state: "CLOSED", closureReason: "EXPIRED", excludedSlotIds: [] });
+  expect((await getEntry(entry.id)).body).toMatchObject({ state: "CLOSED", closureReason: "EXPIRED", excludedSlotIds: [] });
   expect((await post(path)).status).toBe(action === "reject" ? 409 : 200);
   expect(await releaseCount(offer.id)).toBe(1);
 });
@@ -137,7 +149,7 @@ it("preserves an accepted appointment and later participation when withdrawing i
   expect(await post(`/waiting-list-entries/${entry.id}/withdraw`)).toMatchObject({ status: 200, body: { id: entry.id, state: "CLOSED", closureReason: "ACCEPTED" } });
   expect((await api.getReservation("patient-ana", offer.id)).body).toMatchObject({ id: offer.id, state: "CONFIRMED" });
   if (!("id" in joined.body)) throw new Error("Expected new entry");
-  expect((await api.getWaitingListEntry("patient-ana", joined.body.id)).body).toMatchObject({ id: joined.body.id, state: "WAITING" });
+  expect((await getEntry(joined.body.id)).body).toMatchObject({ id: joined.body.id, state: "WAITING" });
   expect(await releaseCount(offer.id)).toBe(0);
 });
 
@@ -148,12 +160,12 @@ it("repeats a past valid rejection without changing a subsequent offer even afte
   await pool.query(`INSERT INTO scheduling.slots SELECT 'decision-test-h2',resource_id,hospital_id,test_type_id,
     starts_at+interval '1 hour',ends_at+interval '1 hour' FROM scheduling.slots WHERE id='decision-test-h1'`);
   await messages.allocate(envelope((await publications()).find((row) => row.payload.reservationId === offer.id)!));
-  const next = await api.getWaitingListEntry("patient-ana", entry.id);
+  const next = await getEntry(entry.id);
   expect(next.body).toMatchObject({ state: "OFFERED", offer: { slotId: "decision-test-h2" } });
   await eventually(async () => (await pool.query("SELECT clock_timestamp() >= expires_at AS expired FROM scheduling.reservations WHERE id=$1", [offer.id])).rows[0].expired, Boolean);
   expect(await post(`/reservations/${offer.id}/reject`)).toEqual(rejected);
   if (!("offer" in next.body) || !next.body.offer) throw new Error("Expected next offer");
-  expect((await api.getWaitingListEntry("patient-ana", entry.id)).body).toMatchObject({
+  expect((await getEntry(entry.id)).body).toMatchObject({
     id: entry.id, state: "OFFERED", admissionOrder: entry.admissionOrder, offer: next.body.offer, excludedSlotIds: ["decision-test-h1"],
   });
   expect(await releaseCount(offer.id)).toBe(1);
@@ -167,13 +179,31 @@ it("keeps rejection separate from cancellation and enforces presented ownership 
   for (const path of [`/reservations/${offer.id}/reject`, `/waiting-list-entries/${entry.id}/withdraw`]) {
     expect((await post(path, "patient-bruno")).status).toBe(404);
     expect((await post(path, "missing-patient")).status).toBe(400);
-    expect((await fetch(`${servers.a.url}${path}`, { method: "POST" })).status).toBe(400);
-    expect((await fetch(`${servers.a.url}${path}`, { method: "POST", headers: { "X-Patient-Id": "patient-ana", "Content-Type": "application/json" }, body: "{}" })).status).toBe(400);
+    for (const options of [
+      { method: "POST" },
+      { method: "POST", headers: { "X-Patient-Id": "patient-ana", "Content-Type": "application/json" }, body: "{}" },
+    ]) {
+      const response = await fetch(`${servers.a.url}${path}`, options);
+      expect(response.status).toBe(400);
+      expect(await expectNetworkContractResponse(document, "POST", path.replace(/\/(reservations|waiting-list-entries)\/[^/]+/, "/$1/{id}"), response)).toEqual({ code: options.body ? "BODY_NOT_ALLOWED" : "INVALID_REQUEST" });
+    }
   }
   expect((await post(`/reservations/${randomUUID()}/reject`)).status).toBe(404);
   expect((await post(`/waiting-list-entries/${randomUUID()}/withdraw`)).status).toBe(404);
   expect((await api.getReservation("patient-ana", offer.id)).body).toMatchObject({ state: "OFFERED" });
   expect(await releaseCount(offer.id)).toBe(0);
+});
+
+it("returns the complete current reservation when rejecting a direct hold, appointment or cancellation", async () => {
+  const held = await create("/slots/decision-test-h1/holds", "patient-ana", "not-an-offer");
+  expect(held.status).toBe(201);
+  expect(await post(`/reservations/${held.body.id}/reject`)).toMatchObject({ status: 409, body: { ...held.body, code: "RESERVATION_STATE_CONFLICT" } });
+  const confirmed = await post(`/reservations/${held.body.id}/confirm`);
+  expect(confirmed.status).toBe(200);
+  expect(await post(`/reservations/${held.body.id}/reject`)).toMatchObject({ status: 409, body: { ...confirmed.body, code: "RESERVATION_STATE_CONFLICT" } });
+  const cancelled = await post(`/reservations/${held.body.id}/cancel`);
+  expect(cancelled.status).toBe(200);
+  expect(await post(`/reservations/${held.body.id}/reject`)).toMatchObject({ status: 409, body: { ...cancelled.body, code: "RESERVATION_STATE_CONFLICT" } });
 });
 
 it("retains the rejecting patient's FIFO while the excluded origin goes to the next eligible patient", async () => {
@@ -186,7 +216,7 @@ it("retains the rejecting patient's FIFO while the excluded origin goes to the n
   await messages.allocate(envelope((await publications()).find((row) => row.payload.reservationId === offer.id)!));
   expect((await pool.query("SELECT slot_id,patient_id FROM scheduling.reservations WHERE slot_id LIKE 'decision-test-%' AND state='OFFERED' ORDER BY slot_id")).rows)
     .toEqual([{ slot_id: "decision-test-h1", patient_id: "patient-bruno" }, { slot_id: "decision-test-h2", patient_id: "patient-ana" }]);
-  expect((await api.getWaitingListEntry("patient-ana", entry.id)).body).toMatchObject({ admissionOrder: entry.admissionOrder, excludedSlotIds: ["decision-test-h1"] });
+  expect((await getEntry(entry.id)).body).toMatchObject({ admissionOrder: entry.admissionOrder, excludedSlotIds: ["decision-test-h1"] });
   expect(await releaseCount(offer.id)).toBe(1);
 });
 
@@ -205,7 +235,7 @@ it.each(["accept-first", "withdraw-first"])("serializes %s in two API processes 
   } finally { await barrier.release(); }
   expect((await first).status).toBe(200);
   expect((await second!).status).toBe(order === "accept-first" ? 200 : 409);
-  expect((await api.getWaitingListEntry("patient-ana", entry.id)).body).toMatchObject({
+  expect((await getEntry(entry.id)).body).toMatchObject({
     state: "CLOSED", closureReason: order === "accept-first" ? "ACCEPTED" : "WITHDRAWN",
   });
   expect((await api.getReservation("patient-ana", offer.id)).body).toMatchObject({ state: order === "accept-first" ? "CONFIRMED" : "CANCELLED" });
@@ -227,7 +257,7 @@ it("rechecks time after two APIs wait across expiry without recovering waiting o
   expect(await rejecting).toMatchObject({ status: 409, body: { state: "EXPIRED", code: "RESERVATION_EXPIRED" } });
   expect(await withdrawing).toMatchObject({ status: 200, body: { state: "CLOSED", closureReason: "EXPIRED" } });
   expect(await releaseCount(offer.id)).toBe(1);
-  expect((await api.getWaitingListEntry("patient-ana", entry.id)).body).toMatchObject({ state: "CLOSED", closureReason: "EXPIRED", excludedSlotIds: [] });
+  expect((await getEntry(entry.id)).body).toMatchObject({ state: "CLOSED", closureReason: "EXPIRED", excludedSlotIds: [] });
 });
 
 it.each(["reject", "withdraw"])("rolls back reservation, entry, exclusion and durable work when %s cannot save outbox", async (action) => {
@@ -237,6 +267,7 @@ it.each(["reject", "withdraw"])("rolls back reservation, entry, exclusion and du
   const restrictedUrl = new URL(databaseUrl); restrictedUrl.searchParams.set("options", `-c role=${role}`);
   const restricted = createDatabasePool(restrictedUrl.toString());
   const failing = schedulingUseCases(postgresScheduling(restricted));
+  const failingHttp = buildApi(async () => {}, async () => ({ evaluatedAt: "2030-01-01T00:00:00.000Z", slots: [] }), failing);
   try {
     await pool.query(`GRANT USAGE ON SCHEMA scheduling TO ${role}`);
     await pool.query(`GRANT SELECT ON ALL TABLES IN SCHEMA scheduling TO ${role}`);
@@ -244,11 +275,16 @@ it.each(["reject", "withdraw"])("rolls back reservation, entry, exclusion and du
     await pool.query(`GRANT INSERT ON scheduling.events,scheduling.reservation_closures,scheduling.waiting_list_slot_exclusions TO ${role}`);
     await expect(action === "reject" ? failing.rejectOffer("patient-ana", offer.id) : failing.withdrawWaitingListEntry("patient-ana", entry.id))
       .rejects.toMatchObject({ code: "42501" });
+    const response = await failingHttp.inject({ method: "POST", url: action === "reject" ? `/reservations/${offer.id}/reject` : `/waiting-list-entries/${entry.id}/withdraw`, headers: { "x-patient-id": "patient-ana" } });
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toEqual({ code: "INTERNAL_ERROR" });
+    expectContractResponse(await readApiContract(failingHttp), "POST", action === "reject" ? "/reservations/{id}/reject" : "/waiting-list-entries/{id}/withdraw", response);
     expect((await api.getReservation("patient-ana", offer.id)).body).toMatchObject({ state: "OFFERED" });
-    expect((await api.getWaitingListEntry("patient-ana", entry.id)).body).toMatchObject({ state: "OFFERED", excludedSlotIds: [], offer: { id: offer.id } });
+    expect((await getEntry(entry.id)).body).toMatchObject({ state: "OFFERED", excludedSlotIds: [], offer: { id: offer.id } });
     expect(await releaseCount(offer.id)).toBe(0);
     expect((await pool.query("SELECT * FROM scheduling.reservation_closures WHERE reservation_id=$1", [offer.id])).rows).toEqual([]);
   } finally {
+    await failingHttp.close();
     await restricted.end();
     await pool.query(`REVOKE ALL ON ALL TABLES IN SCHEMA scheduling FROM ${role}`);
     await pool.query(`REVOKE USAGE ON SCHEMA scheduling FROM ${role}`);
@@ -328,7 +364,7 @@ it.each(["base", "excluded-prefix", "crash-before-relay", "duplicates", "reoccup
     // Observational SQL only: no new business request or replay of H2 can activate this wait.
     const next = await eventually(async () => (await pool.query("SELECT id,slot_id FROM scheduling.reservations WHERE waiting_list_entry_id=$1 AND state='OFFERED'", [joined.body.id])).rows[0], (row) => row?.slot_id === "decision-test-h2", 10000);
     expect(next.id).not.toBe(first.id);
-    const own = await api.getWaitingListEntry("patient-ana", joined.body.id);
+    const own = await getEntry(joined.body.id);
     expect(own.body).toMatchObject({ state: "OFFERED", admissionOrder: joined.body.admissionOrder, excludedSlotIds: expect.arrayContaining([...prefixes, "decision-test-h1"]), offer: { id: next.id } });
     expect((await pool.query("SELECT count(*)::integer AS n FROM scheduling.reservations WHERE slot_id='decision-test-h2' AND state='OFFERED'")).rows[0].n).toBe(1);
     expect(await releaseCount(first.id)).toBe(1);
@@ -371,6 +407,6 @@ it.each([
       : { status: 200, body: { id: entry.id, state: "CLOSED", closureReason: "EXPIRED" } });
     expect(await releaseCount(offer.id)).toBe(1);
     expect((await pool.query("SELECT reason FROM scheduling.reservation_closures WHERE reservation_id=$1", [offer.id])).rows).toEqual([{ reason: "EXPIRED" }]);
-    expect((await api.getWaitingListEntry("patient-ana", entry.id)).body).toMatchObject({ state: "CLOSED", closureReason: "EXPIRED", excludedSlotIds: [] });
+    expect((await getEntry(entry.id)).body).toMatchObject({ state: "CLOSED", closureReason: "EXPIRED", excludedSlotIds: [] });
   } finally { await barrier.release(); await Promise.allSettled([a, b].filter((pending) => pending !== undefined)); await worker.stop(); }
 }, 15000);

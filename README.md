@@ -60,14 +60,15 @@ con la aplicación, sin CDN ni envío a un validador externo.
 curl --fail http://127.0.0.1:3000/openapi.json -o /tmp/diagnostic-openapi.json
 ```
 
-Esta entrega documenta salud, agenda, creación de bloqueos, consulta de reservas,
-confirmación y cancelación. Las cuatro operaciones de lista de espera y rechazo
-de ofertas siguen disponibles por HTTP; su contrato se completa en #19. La prueba de
-cobertura captura las once operaciones de la aplicación completa mediante
-`onRoute`: las siete cubiertas y las cuatro pendientes son explícitas. Los HEAD que
+El contrato cubre las once operaciones públicas: dos de salud y las nueve de
+negocio de la tabla de [contrato HTTP](#contrato-http), incluidas lista de espera
+y decisiones sobre ofertas. La prueba de cobertura captura la aplicación completa
+mediante `onRoute` y contrasta métodos y rutas normalizadas con un inventario
+independiente, sin exclusiones pendientes. Los HEAD que
 Fastify deriva copiando el manejador y esquema GET se registran por separado;
 un HEAD con manejador propio sigue siendo una operación pública. Las rutas de
-artefactos documentales se comprueban aparte.
+artefactos documentales se comprueban aparte; la salud interna del worker queda
+fuera de este contrato público.
 
 En Swagger UI, despliega una consulta de salud y pulsa **Execute**. Para agenda,
 usa `hospitalId=hospital-north`, `testTypeId=mri`,
@@ -78,37 +79,15 @@ una fotografía; consultar no reserva capacidad. Borra un parámetro obligatorio
 para observar `400 INVALID_REQUEST`; un instante sin zona devuelve
 `400 INVALID_INTERVAL` con su mensaje.
 
-Para recorrer las reservas desde Swagger UI, parte de una demo recién creada:
-
-1. Ejecuta `GET /slots` con los parámetros de `hospital-north/mri` anteriores.
-   Copia el `id` de un hueco futuro con `directlyBookable: true`; por ejemplo,
-   `slot-north-mri-1` si aún está libre. Ese es el `id` de la ruta de creación.
-2. En `POST /slots/{id}/holds`, presenta `X-Patient-Id: patient-bruno` e
-   `Idempotency-Key: demo-bruno-docs-hold-1`, sin cuerpo. Guarda la clave antes de
-   ejecutar. El `201` contiene una reserva `HELD`: copia su `id`, distinto al del
-   hueco, y observa `expiresAt` y `startsAt`.
-3. Ejecuta `GET /reservations/{id}` con ese ID de reserva y la misma identidad.
-   Conserva los campos de la reserva y añade `evaluatedAt`, `temporal` y `actions`.
-   Consultar no escribe ni amplía el plazo. Un bloqueo vencido aún pendiente de
-   cierre puede seguir `HELD` con `expired` y `closurePending` verdaderos.
-4. Antes de `expiresAt`, ejecuta `POST /reservations/{id}/confirm`, con la misma
-   identidad, sin cuerpo y sin clave obligatoria. El `200` devuelve el mismo ID
-   en estado `CONFIRMED`. Su antiguo `expiresAt` se conserva y ya no lo caduca.
-5. Antes de `startsAt`, ejecuta `POST /reservations/{id}/cancel` del mismo modo.
-   El `200` devuelve esa reserva `CANCELLED`. Puedes repetir la cancelación,
-   también después del inicio; una confirmación posterior devuelve `409` con la
-   reserva cancelada completa y `code: RESERVATION_STATE_CONFLICT`.
-
-El bloqueo dura como máximo diez minutos y nunca más allá del inicio del hueco;
-la igualdad ya vence. La decisión revalida tiempo y estado. Confirmar o cancelar
-un bloqueo tarde puede comprometer su cierre `EXPIRED` y responder `409
-RESERVATION_EXPIRED`. Repetir la creación con la misma identidad, operación,
-clave y hueco conserva el cuerpo y código exitosos originales, incluso después
-de cancelar: es un replay histórico; consulta el GET para conocer el estado actual.
-Otro hueco con esa clave da `409 IDEMPOTENCY_KEY_REUSED`. Las claves son
-independientes por paciente y operación y los errores no se guardan como éxitos.
-Usa una clave nueva para una nueva intención. Todos los ejemplos usan identidades
-sintéticas falsificables, sin autenticación real.
+El [recorrido de cancelación, oferta y aceptación](#recorrido-breve-cancelación--oferta--aceptación)
+también se ejecuta desde Swagger UI: despliega cada operación y copia los IDs de
+sus respuestas. Introduce `X-Patient-Id` en las operaciones propias y guarda una
+`Idempotency-Key` para cada creación. Solo el alta de espera lleva cuerpo JSON
+con `hospitalId` y `testTypeId`; bloqueos, confirmación, cancelación, rechazo y
+retirada no admiten cuerpo. No hay autenticación real: las identidades sintéticas
+son falsificables. Los esquemas y ejemplos muestran plazos, acciones y conflictos;
+las reglas de [reservas y lista de espera](#reservas-y-lista-de-espera) y los
+[reintentos HTTP](#reintentos-http) precisan su significado.
 
 Versiones exactas: `@fastify/swagger` 9.9.3 y `@fastify/swagger-ui` 6.1.4
 (incorpora Swagger UI 5.34.0). El generador
@@ -119,11 +98,15 @@ recoge soporte desde 5.32.0. El parche 3.2.1 del documento se comprueba con
 para estructura y referencias, más Ajv 8.20.0 y `ajv-formats` 3.0.1 para compilar
 los esquemas JSON Schema 2020-12 y contrastar las respuestas HTTP. Se comprueba
 además que el verificador rechaza referencias rotas, esquemas inválidos y
-respuestas incompatibles. Fastify y el resto del stack conservan sus versiones.
+respuestas incompatibles y operaciones públicas ausentes. Fastify y el resto del
+stack conservan sus versiones.
 
 `pnpm test` ejecuta documento, interfaz, inventario y salud/errores controlados;
-`pnpm test:integration` contrasta también agenda, bloqueos, consultas de reserva,
-confirmación, cancelación, replay y conflictos con PostgreSQL real. Se conservan
+`pnpm test:integration` contrasta las respuestas de negocio con PostgreSQL real:
+agenda, reservas, inscripción nueva/activa, replay `200`/`201`, conflictos, consultas
+con/sin oferta, cierre pendiente, rechazo, retirada y sus tres causas de cierre.
+El recorrido de aceptación usa HTTP real y RabbitMQ, incluida la oferta tras
+cancelación y la confirmación con la misma identidad de reserva. Se conservan
 las comprobaciones de estado, plazos, persistencia y rollback existentes, además
 de validar código, tipo de contenido y cuerpo contra el contrato. Ambos forman
 parte de la CI existente, junto con `pnpm typecheck`
@@ -132,17 +115,23 @@ la representación HTTP, sin acreditar disponibilidad real de PostgreSQL.
 
 ## Recorrido breve: cancelación → oferta → aceptación
 
-Parte de una demo recién creada y usa el único hueco de `hospital-south/mri`.
-Las respuestas contienen IDs generados: sustituye `CARLOS_RESERVATION_ID`,
-`ANA_ENTRY_ID` y `ANA_OFFER_ID` por los obtenidos en cada paso.
+Parte de una demo recién creada y consulta `hospital-south/mri`. Copia el `id`
+de su único hueco futuro con `directlyBookable: true` en `SLOT_ID`. Las respuestas
+posteriores contienen IDs generados: sustituye `CARLOS_RESERVATION_ID`,
+`ANA_ENTRY_ID` y `ANA_OFFER_ID` por los obtenidos en cada paso. El bloqueo debe
+confirmarse antes de su `expiresAt` (diez minutos como máximo, limitado por el
+inicio del hueco); la cita debe cancelarse antes de `startsAt`.
 
 ```bash
 curl --fail --get http://127.0.0.1:3000/slots \
   --data-urlencode hospitalId=hospital-south --data-urlencode testTypeId=mri \
   --data-urlencode from=2020-01-01T00:00:00Z --data-urlencode to=2100-01-01T00:00:00Z
 
-curl --fail -X POST http://127.0.0.1:3000/slots/slot-south-mri-1/holds \
+curl --fail -X POST http://127.0.0.1:3000/slots/SLOT_ID/holds \
   -H 'X-Patient-Id: patient-carlos' -H 'Idempotency-Key: demo-carlos-hold'
+
+curl --fail -X POST http://127.0.0.1:3000/reservations/CARLOS_RESERVATION_ID/confirm \
+  -H 'X-Patient-Id: patient-carlos'
 
 curl --fail -X POST http://127.0.0.1:3000/waiting-list-entries \
   -H 'X-Patient-Id: patient-ana' -H 'Idempotency-Key: demo-ana-entry' \
@@ -160,16 +149,24 @@ docker compose logs worker
 Repite el GET hasta ver `state: OFFERED`. Su `offer.id` es `ANA_OFFER_ID`; el log
 `offer_notification` correlaciona esa reserva y su `expiresAt`. La creación de la
 oferta y el aviso pasan por outbox y RabbitMQ, sin llamada síncrona desde cancelar.
-Acepta antes del vencimiento:
+Acepta antes de `offer.expiresAt`: el plazo es el menor de creación más dos horas
+por defecto e inicio del hueco; en igualdad ya vence. El aviso no garantiza
+vigencia ni recepción humana y aceptar vuelve a validar estado y plazo:
 
 ```bash
 curl --fail -X POST http://127.0.0.1:3000/reservations/ANA_OFFER_ID/confirm \
   -H 'X-Patient-Id: patient-ana'
 curl --fail http://127.0.0.1:3000/reservations/ANA_OFFER_ID \
   -H 'X-Patient-Id: patient-ana'
+curl --fail http://127.0.0.1:3000/waiting-list-entries/ANA_ENTRY_ID \
+  -H 'X-Patient-Id: patient-ana'
 ```
 
-La misma reserva pasa a `CONFIRMED` y la inscripción se cierra por `ACCEPTED`.
+La misma reserva pasa a `CONFIRMED` y la inscripción se cierra por `ACCEPTED`,
+sin campo `offer`. Un GET de oferta vencida todavía puede mostrar `OFFERED`
+con `expired` y `closurePending` verdaderos y todas las acciones falsas; no
+es una nueva espera ni amplía el plazo. Repetir las creaciones con sus claves
+recupera el cuerpo y código históricos; usa GET para comprobar el estado actual.
 Para observar caducidad sin cancelar, arranca una demo nueva con
 `DIRECT_HOLD_TTL_MS=10000 docker compose up --build --wait`, realiza hold y alta
 dentro de esos diez segundos y espera el barrido. Las pruebas E2E automatizadas
