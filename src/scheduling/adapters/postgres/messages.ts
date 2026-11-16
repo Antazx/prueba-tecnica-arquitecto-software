@@ -1,16 +1,16 @@
 import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import type { SchedulingTransaction } from "../../application/scheduling.ts";
-import type { LogicalEvent } from "../../application/messages.ts";
+import { ConsumptionDeferred, type LogicalEvent } from "../../application/messages.ts";
 
 export function messageOperations(client: PoolClient): Pick<SchedulingTransaction,
-  "coordinateConsumption" | "completeConsumption" | "readOfferNotification" | "insertOffer"> {
+  "coordinateConsumption" | "completeConsumption" | "failConsumption" | "readOfferNotification" | "insertOffer"> {
   return {
     async coordinateConsumption(delivery) {
       const key = [delivery.eventId, delivery.consumer, delivery.cycle, delivery.attempt];
       const stored = await client.query<LogicalEvent & { available_at: Date }>(`SELECT e.type, e.version, e.payload, p.available_at
         FROM scheduling.outbox_publications p JOIN scheduling.events e ON e.id=p.event_id
-        WHERE p.id=$5 AND p.event_id=$1 AND p.consumer=$2 AND p.cycle=$3 AND p.attempt=$4`, [...key, delivery.publicationId]);
+        WHERE p.id=$5 AND p.event_id=$1 AND p.consumer=$2 AND p.cycle=$3 AND p.attempt=$4 AND p.destination='work'`, [...key, delivery.publicationId]);
       const event = stored.rows[0];
       if (delivery.version !== 1 || !event) throw new Error("Delivery does not match retained publication");
       await client.query(`INSERT INTO scheduling.consumer_results(event_id, consumer) VALUES ($1,$2) ON CONFLICT DO NOTHING`, key.slice(0, 2));
@@ -19,12 +19,15 @@ export function messageOperations(client: PoolClient): Pick<SchedulingTransactio
       if (result.rows[0].outcome || result.rows[0].current_cycle !== delivery.cycle) return null;
       await client.query(`INSERT INTO scheduling.consumer_cycles(event_id, consumer, cycle, state) VALUES ($1,$2,$3,'active')
         ON CONFLICT DO NOTHING`, key.slice(0, 3));
+      const cycle = await client.query<{ state: string }>(`SELECT state FROM scheduling.consumer_cycles
+        WHERE event_id=$1 AND consumer=$2 AND cycle=$3`, key.slice(0, 3));
+      if (cycle.rows[0].state !== "active") return null;
       await client.query(`INSERT INTO scheduling.consumer_attempts(event_id, consumer, cycle, attempt, not_before)
         VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, [...key, event.available_at]);
       const attempt = await client.query<{ outcome: string | null; ready: boolean }>(`SELECT outcome,
         not_before <= clock_timestamp() AS ready FROM scheduling.consumer_attempts WHERE event_id=$1 AND consumer=$2 AND cycle=$3 AND attempt=$4`, key);
       if (attempt.rows[0].outcome) return null;
-      if (!attempt.rows[0].ready) throw new Error("Delivery arrived before its durable execution date");
+      if (!attempt.rows[0].ready) throw new ConsumptionDeferred("Delivery arrived before its durable execution date");
       return { type: event.type, version: event.version, payload: event.payload };
     },
     async completeConsumption(delivery, outcome, time) {
@@ -34,6 +37,22 @@ export function messageOperations(client: PoolClient): Pick<SchedulingTransactio
       await client.query(`UPDATE scheduling.consumer_cycles SET state='completed' WHERE event_id=$1 AND consumer=$2 AND cycle=$3`, key.slice(0, 3));
       await client.query(`UPDATE scheduling.consumer_results SET outcome=$3, completed_at=$4
         WHERE event_id=$1 AND consumer=$2`, [delivery.eventId, delivery.consumer, outcome, new Date(time)]);
+    },
+    async failConsumption(delivery, error, permanent, plan, time) {
+      const key = [delivery.eventId, delivery.consumer, delivery.cycle, delivery.attempt];
+      await client.query(`UPDATE scheduling.consumer_attempts SET outcome='failed', completed_at=$5,last_error=$6,failure_kind=$7
+        WHERE event_id=$1 AND consumer=$2 AND cycle=$3 AND attempt=$4`, [...key, new Date(time), error, permanent ? "permanent" : "transient"]);
+      if (plan.kind === "retry") {
+        await client.query(`INSERT INTO scheduling.consumer_attempts(event_id,consumer,cycle,attempt,not_before)
+          VALUES ($1,$2,$3,$4,$5)`, [delivery.eventId, delivery.consumer, delivery.cycle, plan.attempt, new Date(plan.notBefore)]);
+        await client.query(`INSERT INTO scheduling.outbox_publications(id,event_id,consumer,cycle,attempt,available_at,created_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7)`, [randomUUID(), delivery.eventId, delivery.consumer, delivery.cycle, plan.attempt, new Date(plan.notBefore), new Date(time)]);
+      } else {
+        await client.query(`UPDATE scheduling.consumer_cycles SET state='parked',parked_at=$4,park_reason=$5
+          WHERE event_id=$1 AND consumer=$2 AND cycle=$3`, [delivery.eventId, delivery.consumer, delivery.cycle, new Date(time), plan.reason]);
+        await client.query(`INSERT INTO scheduling.outbox_publications(id,event_id,consumer,cycle,attempt,available_at,created_at,destination)
+          VALUES ($1,$2,$3,$4,$5,$6,$6,'dead')`, [randomUUID(), ...key, new Date(time)]);
+      }
     },
     async readOfferNotification(reservationId, eventId) {
       // A fresh command immediately before output; never lock the business scope here.

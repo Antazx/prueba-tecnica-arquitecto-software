@@ -1,6 +1,7 @@
 import type { WaitingListEntry, WaitingListRepresentation, WaitingListScope, AdmissionState } from "./waiting-list.ts";
 import type { ReservationClosureReason, ReservationState } from "../domain/reservation.ts";
 import type { Delivery, LogicalEvent, OfferNotification } from "./messages.ts";
+import type { FailurePlan } from "../domain/message-retries.ts";
 
 export interface Reservation {
   id: string;
@@ -33,6 +34,7 @@ export interface ProtectedSlot { id: string; startsAt: number; endsAt: number; o
 export interface SchedulingTransaction {
   coordinateConsumption(delivery: Delivery): Promise<LogicalEvent | null>;
   completeConsumption(delivery: Delivery, outcome: "succeeded" | "discarded", time: number): Promise<void>;
+  failConsumption(delivery: Delivery, error: string, permanent: boolean, plan: FailurePlan, time: number): Promise<void>;
   readOfferNotification(reservationId: string, eventId: string): Promise<OfferNotification | null>;
   insertOffer(reservation: Reservation & { waitingListEntryId: string }, scope: WaitingListScope): Promise<void>;
   lockWaitingListScope(scope: WaitingListScope): Promise<boolean>;
@@ -62,5 +64,9 @@ export interface Scheduling {
 }
 
 export class DependencyUnavailable extends Error {
-  constructor(cause: unknown) { super("Scheduling storage is temporarily unavailable", { cause }); }
+  readonly scope: "global" | "operation";
+  constructor(cause: unknown, scope: "global" | "operation" = "global") {
+    super("Scheduling storage is temporarily unavailable", { cause });
+    this.scope = scope;
+  }
 }

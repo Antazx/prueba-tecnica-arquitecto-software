@@ -1,6 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import type { Channel, ChannelModel, ConfirmChannel, Message } from "amqplib";
-import type { Delivery } from "../../application/messages.ts";
+import { ConsumptionDeferred, ConsumptionPaused, type Delivery } from "../../application/messages.ts";
+import { DependencyUnavailable } from "../../application/scheduling.ts";
 import type { PublicationResult } from "../../application/outbox.ts";
 
 export const queues = { allocation: "appointments.allocation", notification: "appointments.notifications" } as const;
@@ -61,7 +62,8 @@ export function publishConfirmed(channel: ConfirmChannel, exchange: string, rout
 
 export async function publishDelivery(channel: ConfirmChannel, delivery: Delivery, timeoutMs = 5000): Promise<PublicationResult> {
   try {
-    await publishConfirmed(channel, "appointments.work", delivery.consumer, delivery, timeoutMs);
+    await publishConfirmed(channel, delivery.destination === "dead" ? "appointments.dead" : "appointments.work",
+      delivery.destination === "dead" ? `${delivery.consumer}.dead` : delivery.consumer, delivery, timeoutMs);
     return { accepted: true };
   } catch (error) {
     if (error instanceof UnroutablePublicationError) return { accepted: false, error: error.message };
@@ -76,11 +78,13 @@ export function parseDelivery(content: Buffer): Delivery {
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (row.version !== 1 || typeof row.publicationId !== "string" || !uuid.test(row.publicationId) ||
     typeof row.eventId !== "string" || !uuid.test(row.eventId) || typeof row.consumer !== "string" || !["allocation", "notification"].includes(row.consumer) ||
-    !Number.isSafeInteger(row.cycle) || Number(row.cycle) < 0 || !Number.isInteger(row.attempt) || Number(row.attempt) < 0 || Number(row.attempt) > 3) {
+    !Number.isSafeInteger(row.cycle) || Number(row.cycle) < 0 || !Number.isInteger(row.attempt) || Number(row.attempt) < 0 || Number(row.attempt) > 3 ||
+    (row.destination !== undefined && row.destination !== "dead")) {
     throw new Error("Invalid work envelope");
   }
   return { version: 1, publicationId: row.publicationId, eventId: row.eventId,
-    consumer: row.consumer as Delivery["consumer"], cycle: Number(row.cycle), attempt: Number(row.attempt) };
+    consumer: row.consumer as Delivery["consumer"], cycle: Number(row.cycle), attempt: Number(row.attempt),
+    ...(row.destination === "dead" ? { destination: "dead" as const } : {}) };
 }
 
 export async function consumeWork(connection: ChannelModel, consumer: Delivery["consumer"], handle: (delivery: Delivery) => Promise<void>) {
@@ -98,10 +102,13 @@ export async function consumeWork(connection: ChannelModel, consumer: Delivery["
         channel.ack(message);
       } catch (error) {
         console.warn(JSON.stringify({ event: "message_processing_failed", consumer, message: error instanceof Error ? error.message : "Unknown error" }));
-        // Durable logical retries are added by the retry delivery. Until then retain work,
-        // rate limit failures and let the independent physical broker protection apply.
         await delay(1000);
-        try { channel.reject(message, true); } catch { /* A closed channel leaves delivery unacknowledged. */ }
+        try {
+          // An outage or early delivery pauses this prefetch=1 consumer without spending
+          // either logical attempts or RabbitMQ's failed-delivery budget.
+          if (error instanceof DependencyUnavailable || error instanceof ConsumptionDeferred || error instanceof ConsumptionPaused) channel.nack(message, false, true);
+          else channel.reject(message, true);
+        } catch { /* A closed channel leaves delivery unacknowledged. */ }
       }
     })();
   }, { noAck: false });

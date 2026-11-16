@@ -108,8 +108,13 @@ export function postgresScheduling(pool: Pool): Scheduling {
     async transaction(work) {
       let client: PoolClient | undefined;
       let discard = false;
+      let connectionError: Error | undefined;
+      const onConnectionError = (error: Error) => { connectionError = error; discard = true; };
       try {
         client = await pool.connect();
+        // pg removes its idle listener while a client is checked out. Observe the
+        // connection event as well as query rejection, including a lost COMMIT reply.
+        client.on("error", onConnectionError);
         await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
         await client.query("SET LOCAL lock_timeout = '2s'");
         await client.query("SET LOCAL statement_timeout = '2500ms'");
@@ -120,9 +125,10 @@ export function postgresScheduling(pool: Pool): Scheduling {
         if (client) {
           try { await client.query("ROLLBACK"); } catch { discard = true; }
         }
-        throw storageError(error);
+        throw storageError(connectionError ?? error);
       } finally {
         client?.release(discard);
+        client?.off("error", onConnectionError);
       }
     },
     async patientExists(patientId) {

@@ -135,7 +135,8 @@ CREATE TABLE IF NOT EXISTS scheduling.outbox_publications (
     last_attempt_at timestamptz,
     last_error text,
     next_attempt_at timestamptz,
-    published_at timestamptz
+    published_at timestamptz,
+    destination text NOT NULL DEFAULT 'work' CHECK (destination IN ('work', 'dead'))
 );
 CREATE INDEX IF NOT EXISTS outbox_ready_idx ON scheduling.outbox_publications(GREATEST(available_at, next_attempt_at), created_at, id)
     WHERE published_at IS NULL;
@@ -156,6 +157,8 @@ CREATE TABLE IF NOT EXISTS scheduling.consumer_cycles (
     consumer text NOT NULL,
     cycle integer NOT NULL CHECK (cycle >= 0),
     state text NOT NULL CHECK (state IN ('active', 'completed', 'parked')),
+    parked_at timestamptz,
+    park_reason text CHECK (park_reason IN ('permanent', 'exhausted')),
     PRIMARY KEY (event_id, consumer, cycle),
     FOREIGN KEY (event_id, consumer) REFERENCES scheduling.consumer_results(event_id, consumer)
 );
@@ -167,6 +170,8 @@ CREATE TABLE IF NOT EXISTS scheduling.consumer_attempts (
     not_before timestamptz NOT NULL,
     outcome text CHECK (outcome IN ('succeeded', 'discarded', 'failed')),
     completed_at timestamptz,
+    last_error text,
+    failure_kind text CHECK (failure_kind IN ('transient', 'permanent')),
     PRIMARY KEY (event_id, consumer, cycle, attempt),
     FOREIGN KEY (event_id, consumer, cycle) REFERENCES scheduling.consumer_cycles(event_id, consumer, cycle),
     CHECK ((outcome IS NULL) = (completed_at IS NULL))
