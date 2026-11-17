@@ -2,6 +2,7 @@ import { expect, it } from "vitest";
 import { createDatabasePool } from "../../src/scheduling/adapters/postgres/database.ts";
 import { eventually, startApiPair } from "../helpers/concurrency.ts";
 import { startWorkerProcess } from "../helpers/worker-process.ts";
+import { readApiContract, expectNetworkContractResponse, type ApiDocument } from "../helpers/openapi.ts";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const rabbitmqUrl = process.env.TEST_RABBITMQ_URL;
@@ -17,16 +18,24 @@ it("AC54: expires Carlos's hold through the normal sweep, offers and logs for An
   const apis = await startApiPair(target.toString(), "async-offers-e2e", { DIRECT_HOLD_TTL_MS: "2500" });
   let w1: Awaited<ReturnType<typeof startWorkerProcess>> | undefined;
   const w2 = await startWorkerProcess(target.toString(), rabbitmqUrl, { relay: false });
+  let document: ApiDocument;
   const post = async (url: string, patientId: string, key?: string, body?: object) => {
     const response = await fetch(`${apis.a.url}${url}`, { method: "POST", headers: {
       "x-patient-id": patientId, ...(key ? { "idempotency-key": key } : {}), ...(body ? { "content-type": "application/json" } : {}),
     }, body: body ? JSON.stringify(body) : undefined });
-    return { status: response.status, body: await response.json() };
+    return { status: response.status, body: await expectNetworkContractResponse(document, "POST", url.replace(/\/(reservations|slots|waiting-list-entries)\/[^/]+/, "/$1/{id}"), response) };
   };
-  const get = async (id: string, patientId: string) => (await fetch(`${apis.b.url}/waiting-list-entries/${id}`, { headers: { "x-patient-id": patientId } })).json();
+  const get = async (id: string, patientId: string) => {
+    const response = await fetch(`${apis.b.url}/waiting-list-entries/${id}`, { headers: { "x-patient-id": patientId } });
+    expect(response.status).toBe(200);
+    return expectNetworkContractResponse(document, "GET", "/waiting-list-entries/{id}", response);
+  };
   try {
+    document = await readApiContract(apis.a.url);
     const scope = { hospitalId: "hospital-south", testTypeId: "mri" };
-    const agenda = await (await fetch(`${apis.a.url}/slots?${new URLSearchParams({ ...scope, from: "2020-01-01T00:00:00Z", to: "2100-01-01T00:00:00Z" })}`)).json();
+    const agendaResponse = await fetch(`${apis.a.url}/slots?${new URLSearchParams({ ...scope, from: "2020-01-01T00:00:00Z", to: "2100-01-01T00:00:00Z" })}`);
+    expect(agendaResponse.status).toBe(200);
+    const agenda = await expectNetworkContractResponse(document, "GET", "/slots", agendaResponse);
     expect(agenda.slots).toHaveLength(1);
     expect(agenda.slots[0]).toMatchObject({ id: "slot-south-mri-1", directlyBookable: true });
     const held = await post("/slots/slot-south-mri-1/holds", "patient-carlos", "ac54-carlos");
@@ -36,7 +45,9 @@ it("AC54: expires Carlos's hold through the normal sweep, offers and logs for An
     expect([ana.status, bruno.status]).toEqual([201, 201]);
     expect(await get(ana.body.id, "patient-ana")).toMatchObject({ state: "WAITING", admissionOrder: "1" });
     expect(await get(bruno.body.id, "patient-bruno")).toMatchObject({ state: "WAITING", admissionOrder: "2" });
-    const stillHeld = await (await fetch(`${apis.b.url}/reservations/${held.body.id}`, { headers: { "x-patient-id": "patient-carlos" } })).json();
+    const heldResponse = await fetch(`${apis.b.url}/reservations/${held.body.id}`, { headers: { "x-patient-id": "patient-carlos" } });
+    expect(heldResponse.status).toBe(200);
+    const stillHeld = await expectNetworkContractResponse(document, "GET", "/reservations/{id}", heldResponse);
     expect(stillHeld).toMatchObject({ state: "HELD", expiresAt: held.body.expiresAt, temporal: { expired: false, closurePending: false } });
     await eventually(async () => (await pool.query("SELECT state FROM scheduling.reservations WHERE id=$1", [held.body.id])).rows[0].state, (state) => state === "EXPIRED", 8000);
     expect((await pool.query("SELECT count(*)::integer AS n FROM scheduling.outbox_publications WHERE published_at IS NOT NULL")).rows[0].n).toBe(0);
@@ -61,6 +72,8 @@ it("AC54: expires Carlos's hold through the normal sweep, offers and logs for An
     expect((await post(`/reservations/${next.offer.id}/confirm`, "patient-bruno")).status).toBe(200);
     expect((await get(ana.body.id, "patient-ana")).closureReason).toBe("ACCEPTED");
     expect((await get(bruno.body.id, "patient-bruno")).closureReason).toBe("ACCEPTED");
+    expect(await get(ana.body.id, "patient-ana")).not.toHaveProperty("offer");
+    expect(await get(bruno.body.id, "patient-bruno")).not.toHaveProperty("offer");
   } finally {
     await w1?.stop(); await w2.stop(); await apis.stop(); await pool.end();
   }

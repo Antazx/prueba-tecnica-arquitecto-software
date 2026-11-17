@@ -3,6 +3,8 @@ import { createDatabasePool } from "../../src/scheduling/adapters/postgres/datab
 import { initializeDatabase } from "../../src/scheduling/adapters/postgres/initialize.ts";
 import { buildApi } from "../../src/scheduling/adapters/http/api.ts";
 import { listSlots } from "../../src/scheduling/adapters/postgres/slots.ts";
+import { readApiContract, expectContractResponse } from "../helpers/openapi.ts";
+import type { ApiDocument } from "../helpers/openapi.ts";
 import type { AgendaSnapshot } from "../../src/scheduling/application/agenda.ts";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
@@ -13,9 +15,14 @@ readOnlyUrl.searchParams.set("options", "-c default_transaction_read_only=on");
 const reader = createDatabasePool(readOnlyUrl.toString());
 const api = buildApi(() => Promise.resolve(), (query) => listSlots(reader, query));
 const baseQuery = { hospitalId: "hospital-north", testTypeId: "mri", from: "2020-01-01T00:00:00Z", to: "2100-01-01T00:00:00Z" };
-const getSlots = (query = baseQuery) => api.inject({ url: `/slots?${new URLSearchParams(query)}` });
+const getSlots = async (query = baseQuery) => {
+  const response = await api.inject({ url: `/slots?${new URLSearchParams(query)}` });
+  expectContractResponse(document, "GET", "/slots", response);
+  return response;
+};
 
-beforeAll(async () => { await initializeDatabase(pool); });
+let document: ApiDocument;
+beforeAll(async () => { await initializeDatabase(pool); document = await readApiContract(api); });
 afterAll(async () => { await api.close(); await reader.end(); await pool.end(); });
 
 describe("seeded agenda over HTTP and PostgreSQL", () => {
@@ -73,7 +80,9 @@ describe("seeded agenda over HTTP and PostgreSQL", () => {
     new URLSearchParams({ ...baseQuery, extra: "unexpected" }).toString(),
     `${new URLSearchParams(baseQuery)}&from=2030-01-01T00:00:00Z`,
   ])("rejects an invalid agenda query: %s", async (query) => {
-    expect((await api.inject({ url: `/slots?${query}` })).statusCode).toBe(400);
+    const response = await api.inject({ url: `/slots?${query}` });
+    expect(response.statusCode).toBe(400);
+    expectContractResponse(document, "GET", "/slots", response);
   });
 
   it("excludes slots that have already started without removing their persisted agenda", async () => {
