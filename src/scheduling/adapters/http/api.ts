@@ -32,6 +32,12 @@ export function buildApi(checkPostgres: () => Promise<void>, readAgenda: AgendaR
       openapi: "3.2.1",
       info: { title: "Citación de pruebas diagnósticas", version: "0.1.0", description: "API de demostración con datos exclusivamente sintéticos." },
       servers: [{ url: "/" }],
+      tags: [
+        { name: "Agenda" },
+        { name: "Reservas" },
+        { name: "Lista de espera" },
+        { name: "Salud" },
+      ],
     },
   });
   api.register(swaggerUi, {
