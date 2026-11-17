@@ -137,13 +137,20 @@ export function postgresScheduling(pool: Pool): Scheduling {
       try { return await patientExists(pool, patientId); } catch (error) { throw storageError(error); }
     },
     readOwnWaitingListEntry: (patientId, entryId) => readOwnWaitingListEntry(pool, patientId, entryId),
-    async dueTemporaryReservations() {
+    async dueTemporaryReservations(cursor) {
       try {
+        const through = cursor?.through ?? (await pool.query<{ at: Date }>(
+          "SELECT date_trunc('milliseconds', clock_timestamp()) AS at")).rows[0].at.getTime();
         // Candidates only: every transition locks and revalidates the reservation afresh.
-        const result = await pool.query<{ id: string; patientId: string }>(`SELECT id, patient_id AS "patientId"
-          FROM scheduling.reservations WHERE state IN ('HELD', 'OFFERED') AND expires_at <= date_trunc('milliseconds', clock_timestamp())
-          ORDER BY expires_at, id LIMIT 100`);
-        return result.rows;
+        const result = await pool.query<{ id: string; patientId: string; expiresAt: Date }>(
+          `SELECT id, patient_id AS "patientId", expires_at AS "expiresAt"
+          FROM scheduling.reservations WHERE state IN ('HELD', 'OFFERED') AND expires_at <= $1
+            AND ($2::timestamptz IS NULL OR (expires_at, id) > ($2::timestamptz, $3::uuid))
+          ORDER BY expires_at, id LIMIT 100`,
+        [new Date(through), cursor ? new Date(cursor.expiresAt) : null, cursor?.id ?? null]);
+        const last = result.rows.at(-1);
+        return { candidates: result.rows.map(({ id, patientId }) => ({ id, patientId })),
+          next: result.rows.length === 100 && last ? { expiresAt: last.expiresAt.getTime(), id: last.id, through } : undefined };
       } catch (error) { throw storageError(error); }
     },
     async readOwnReservation(patientId, reservationId) {

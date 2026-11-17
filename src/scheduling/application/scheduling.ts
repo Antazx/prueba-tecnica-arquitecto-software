@@ -57,10 +57,17 @@ export interface SchedulingTransaction {
   saveCreationResult(identity: CreationIdentity, result: CreationResult): Promise<void>;
 }
 
+// Each pass has a fixed deadline so new expirations cannot postpone retries forever.
+export interface ExpiryCursor { expiresAt: number; id: string; through: number }
+export interface ExpiryBatch {
+  candidates: { id: string; patientId: string }[];
+  next?: ExpiryCursor;
+}
+
 export interface Scheduling {
   transaction<T>(work: (transaction: SchedulingTransaction) => Promise<T>): Promise<T>;
   readOwnWaitingListEntry(patientId: string, entryId: string): Promise<{ entry: WaitingListEntry; evaluatedAt: number } | null>;
-  dueTemporaryReservations(): Promise<{ id: string; patientId: string }[]>;
+  dueTemporaryReservations(cursor?: ExpiryCursor): Promise<ExpiryBatch>;
   patientExists(patientId: string): Promise<boolean>;
   readOwnReservation(patientId: string, reservationId: string): Promise<{ reservation: Reservation; evaluatedAt: number } | null>;
 }

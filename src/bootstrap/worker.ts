@@ -6,6 +6,7 @@ import { checkDatabase, createDatabasePool } from "../scheduling/adapters/postgr
 import { initializeDatabase } from "../scheduling/adapters/postgres/initialize.ts";
 import { postgresScheduling } from "../scheduling/adapters/postgres/scheduling.ts";
 import { schedulingUseCases } from "../scheduling/application/reservations.ts";
+import { DependencyUnavailable } from "../scheduling/application/scheduling.ts";
 import { closeRabbitMq, connectToRabbitMq } from "../scheduling/adapters/rabbitmq/connection.ts";
 import { assertTopology, consumeWork, publishDelivery } from "../scheduling/adapters/rabbitmq/messaging.ts";
 import { relayReadyPublications } from "../scheduling/application/outbox.ts";
@@ -49,15 +50,25 @@ async function main() {
           initialized = true;
         }
         await checkDatabase(pool);
-        if (Date.now() >= nextSweep) {
-          await scheduling.expireTemporaryReservations();
-          nextSweep = Date.now() + config.expirySweepIntervalMs;
-        }
         state.postgres = true;
       } catch (error) {
         initialized = false;
         state.postgres = false;
-        console.warn(JSON.stringify({ event: "expiry_sweep_failed", message: error instanceof Error ? error.message : "Unknown error" }));
+        console.warn(JSON.stringify({ event: "database_check_failed", message: error instanceof Error ? error.message : "Unknown error" }));
+      }
+
+      if (state.postgres && Date.now() >= nextSweep) {
+        try {
+          await scheduling.expireTemporaryReservations();
+        } catch (error) {
+          if (error instanceof DependencyUnavailable && error.scope === "global") {
+            initialized = false;
+            state.postgres = false;
+          }
+          console.warn(JSON.stringify({ event: "expiry_sweep_failed", message: error instanceof Error ? error.message : "Unknown error" }));
+        } finally {
+          nextSweep = Date.now() + config.expirySweepIntervalMs;
+        }
       }
 
       if (!connection && Date.now() >= nextConnection) {

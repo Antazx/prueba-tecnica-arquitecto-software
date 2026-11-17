@@ -208,6 +208,18 @@ distintos pueden avanzar independientemente; dentro del ámbito se serializan
 escrituras cortas, sin esperar al paciente ni al broker. Lock timeout: 2 s;
 statement timeout: 2,5 s. No son un SLO de respuesta.
 
+El barrido procesa hasta 100 reservas por ciclo, con una transacción por reserva.
+Un fallo local revierte esa transacción, se registra como `reservation_expiry_failed`
+con el ID de reserva y permite continuar con las demás y publicar la outbox.
+La indisponibilidad global identificada de PostgreSQL detiene el procesamiento;
+un error local del barrido no cambia por sí solo la salud de la base de datos.
+El recorrido avanza por vencimiento/ID y fija su fecha de corte al empezar, para
+que un lote defectuoso no oculte los siguientes ni las nuevas caducidades impidan
+volver a los fallidos. Estos se reintentan en el siguiente recorrido, respetando
+el intervalo configurado entre ciclos. La posición se guarda solo en memoria:
+reiniciar empieza desde el principio. Se conserva el límite de lote, sin prometer
+una duración máxima del ciclo ante esperas de bloqueo.
+
 Negocio y eventos/outbox se comprometen juntos. `SlotReleased` y
 `AllocationReviewRequested` revisan el ámbito vigente; `OfferCreated` avisa de
 una oferta concreta ya creada. Los mensajes tienen versión e identidades
@@ -351,6 +363,11 @@ a bases externas ni con datos reales. Incluyen esperas reales de 5/30/120 s y de
 traslado DLX, por lo que tardan varios minutos. La CI configurada ejecuta topología,
 typecheck estricto de aplicación/pruebas, unitarias, integraciones y build.
 No hay lint, formateador, umbral de cobertura ni benchmark obligatorios configurados.
+`test/integration/expiry-isolation.test.ts` ejecuta un worker real con PostgreSQL
+y RabbitMQ: mantiene fallos al commit en una reserva y en un lote de 100, comprueba
+rollback, progreso de otro ámbito, publicación y consumo, y recuperación tras
+retirar el fallo. Las unitarias verifican además que la indisponibilidad global
+se propaga y detiene el lote.
 La matriz registra resultados locales ejecutados; el estado remoto de CI se
 consulta por su SHA y no se infiere de esos resultados.
 
