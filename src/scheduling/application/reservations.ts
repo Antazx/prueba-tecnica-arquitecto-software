@@ -2,11 +2,12 @@ import { waitingListUseCases } from "./waiting-list.ts";
 import { offerDecisionUseCases } from "./offer-decisions.ts";
 import { randomUUID } from "node:crypto";
 import { decideDirectHold, evaluateReservation, decideConfirmation, decideCancellation } from "../domain/reservation.ts";
-import type { Reservation, Scheduling } from "./scheduling.ts";
+import { DependencyUnavailable, type ExpiryCursor, type Reservation, type Scheduling } from "./scheduling.ts";
 import { representReservation as represent } from "./reservation-representation.ts";
 import { expireReservation } from "./reservation-expiry.ts";
 
 export function schedulingUseCases(scheduling: Scheduling, options: { holdTtlMs?: number } = {}) {
+  let expiryCursor: ExpiryCursor | undefined;
   return {
     ...waitingListUseCases(scheduling),
     ...offerDecisionUseCases(scheduling),
@@ -70,17 +71,26 @@ export function schedulingUseCases(scheduling: Scheduling, options: { holdTtlMs?
     },
     async expireTemporaryReservations() {
       let expiredCount = 0;
-      for (const candidate of await scheduling.dueTemporaryReservations()) {
-        const expired = await scheduling.transaction(async (transaction) => {
-          const reservation = await transaction.lockOwnReservation(candidate.patientId, candidate.id);
-          if (!reservation || !["HELD", "OFFERED"].includes(reservation.state)) return false;
-          const evaluatedAt = await transaction.currentTime();
-          if (!evaluateReservation(reservation, evaluatedAt).expired) return false;
-          await expireReservation(transaction, reservation, evaluatedAt);
-          return true;
-        });
-        if (expired) expiredCount++;
+      const batch = await scheduling.dueTemporaryReservations(expiryCursor);
+      for (const candidate of batch.candidates) {
+        try {
+          const expired = await scheduling.transaction(async (transaction) => {
+            const reservation = await transaction.lockOwnReservation(candidate.patientId, candidate.id);
+            if (!reservation || !["HELD", "OFFERED"].includes(reservation.state)) return false;
+            const evaluatedAt = await transaction.currentTime();
+            if (!evaluateReservation(reservation, evaluatedAt).expired) return false;
+            await expireReservation(transaction, reservation, evaluatedAt);
+            return true;
+          });
+          if (expired) expiredCount++;
+        } catch (error) {
+          if (error instanceof DependencyUnavailable && error.scope === "global") throw error;
+          // The transaction has already rolled back. Keep this candidate for the next pass.
+          console.warn(JSON.stringify({ event: "reservation_expiry_failed", reservationId: candidate.id,
+            message: error instanceof Error ? error.message : "Unknown error" }));
+        }
       }
+      expiryCursor = batch.next;
       return expiredCount;
     },
     async getReservation(patientId: string, reservationId: string) {
