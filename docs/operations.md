@@ -358,10 +358,30 @@ del host cuando cambies puertos publicados. El worker local necesita
 
 Los comandos están en [Verificación del README](../README.md#verificación).
 
-Las integraciones crean fixtures/bases/roles y producen mensajes; no apuntarlas
-a bases externas ni con datos reales. Incluyen esperas reales de 5/30/120 s y del
-traslado DLX, por lo que tardan varios minutos. La CI configurada ejecuta topología,
-typecheck estricto de aplicación/pruebas, unitarias, integraciones y build.
+`pnpm test:integration` prepara y elimina su propio entorno Docker temporal;
+puedes ejecutarlo con la demo activa y sin configurar URLs de prueba. Cada
+ejecución utiliza un proyecto `appointment-tests-<UUID>`, volúmenes nuevos y
+puertos de loopback asignados por Docker. Solo levanta PostgreSQL y RabbitMQ con
+el `compose.yaml` del repositorio, espera sus healthchecks y ejecuta el verificador
+de topología existente sobre ese mismo proyecto. Los escenarios siguen creando
+sus propios procesos API y worker cuando los necesitan.
+
+El comando ignora `.env` y las variables `COMPOSE_*` heredadas y sustituye los
+puertos y las URLs de conexión de la suite por los del entorno temporal. Así evita
+que la configuración de la demo redirija accidentalmente las integraciones.
+Imprime el nombre del proyecto y sus puertos para identificar la ejecución.
+
+Las integraciones crean fixtures/bases/roles y mensajes sintéticos. Al terminar,
+también ante un fallo o una interrupción con `Ctrl+C`, el comando elimina solo
+sus contenedores, red y volúmenes. Antes de limpiar un fallo muestra el estado y
+las últimas 100 líneas de logs de cada servicio; no conserva los almacenes para
+inspección posterior. Mantiene el código de salida de la suite; si falla la
+preparación o la limpieza, también termina con error. Si Docker no permite la
+limpieza, informa del proyecto afectado y del fallo.
+
+Incluyen esperas reales de 5/30/120 s y del traslado DLX, por lo que tardan varios
+minutos. La CI utiliza el mismo `pnpm test:integration`, manteniendo separados
+typecheck estricto de aplicación/pruebas, unitarias y build.
 No hay lint, formateador, umbral de cobertura ni benchmark obligatorios configurados.
 `test/integration/expiry-isolation.test.ts` ejecuta un worker real con PostgreSQL
 y RabbitMQ: mantiene fallos al commit en una reserva y en un lote de 100, comprueba
