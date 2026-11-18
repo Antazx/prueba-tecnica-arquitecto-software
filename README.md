@@ -227,24 +227,31 @@ y RabbitMQ reales, trazadas en la [matriz de aceptación](docs/acceptance.md).
 
 ## Verificación
 
-Requiere Node/pnpm y las dependencias instaladas; consulta la
+Requiere Docker en ejecución, Compose con soporte de `--wait`, Node/pnpm y las
+dependencias instaladas; consulta la
 [configuración de desarrollo](docs/operations.md#configuración-y-desarrollo).
-Con PostgreSQL y RabbitMQ de la demo en ejecución:
+La demo puede permanecer activa:
 
 ```bash
 pnpm typecheck
 pnpm test
-TEST_DATABASE_URL=postgresql://diagnostic:diagnostic_dev@127.0.0.1:5432/diagnostic_appointments \
-TEST_RABBITMQ_URL=amqp://diagnostic:diagnostic_dev@127.0.0.1:5672 \
-  pnpm test:integration
+pnpm test:integration
 pnpm build
 ```
 
-Las integraciones crean bases/fixtures sintéticos y mensajes: **no apuntarlas a
-bases externas ni con datos reales**. Cubren concurrencia, caducidades, FIFO,
-ofertas y fallos de transporte. Tardan varios minutos por las esperas reales de
-reintento. La CI ejecuta estas comprobaciones y verifica la topología de RabbitMQ;
-los resultados locales y sus límites están en la matriz de aceptación.
+Cada `pnpm test:integration` crea un proyecto Docker nuevo con PostgreSQL y
+RabbitMQ propios, espera su disponibilidad y verifica la topología del broker
+antes de ejecutar la suite. Usa puertos libres asignados por Docker y configura
+las URLs automáticamente, sin compartir datos ni mensajes con la demo. Reutiliza
+`compose.yaml`; no arranca los servicios API ni worker de Compose.
+
+Al terminar elimina sus contenedores, red y volúmenes. Si falla, muestra estado y
+logs antes de limpiar y conserva el código de salida fallido. La siguiente
+ejecución comienza con almacenes nuevos. Las integraciones usan datos sintéticos
+y cubren concurrencia, caducidades, FIFO, ofertas y fallos de transporte; tardan
+varios minutos por las esperas reales de reintento. La CI utiliza el mismo comando,
+con typecheck, unitarias y build separados. Los resultados locales y sus límites
+están en la matriz de aceptación.
 
 ## Documentación de referencia
 
